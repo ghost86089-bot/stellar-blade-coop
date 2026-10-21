@@ -4,7 +4,8 @@
 -- recruiter preview on the co-op save slot only (both ticked every frame until coop off, which despawns the recruiter
 -- on any slot even when that raises), coop look changes what the ghost shows and builds it again, coop fight (the
 -- shared enemies, experimental) checks its arguments, the co-op slot and its settings, starts once a load with
--- shared_enemies=on and says on and off on screen, the photo mode is read every 250 ms with a save loaded and goes into
+-- shared_enemies=on and says on and off on screen, coop fight pilot (same-place enemies) checks its own and same_place
+-- goes with coop fight on and the menu's row and says on and off on screen, the photo mode is read every 250 ms with a save loaded and goes into
 -- the state with its settings while our own veils the notices, the ghost and its tag as set, coop freeze checks its
 -- arguments, coop ui test reaches the UI spike (ticked every frame until coop off, which stops it), coop-chat.txt is
 -- taken every 250 ms (session or not, coop off included) and its text never logged, the co-op menu (menu.lua on a fake
@@ -64,8 +65,10 @@ local status_text='mod=v proto=3 steam=ready\nlink=none lobby=0\nlast=#1 ready\n
 local link_mode='none' -- What link.mode() says, as of the last changes().
 local ping_ms,write_refusal=nil,nil -- link.ping(); why link.write_settings fails (nil: it writes).
 local mate_v=nil -- link.mate(): her vitals.
+local paks_v=nil -- link.paks(): her .pak mods against ours.
 local friend_name,friend_linked='Kaanta',true -- link.friend()'s name and linked.
 local fight_text,fight_reads=nil,0 -- What link.fight() says (the fight= line), and how often it was asked.
+local pilot_text,pilot_reads=nil,0 -- What link.pilot() says (the pilot= line), and how often it was asked.
 local chatting,chat_lines,chat_takes=false,{},0 -- link.chatting(), coop-chat.txt's lines, and its takes.
 local said_lines,say_refusal={},nil -- Our lines link.say wrote into coop-say.txt; why it refuses (nil: it writes).
 local saves_info={} -- link.saves(): the slot line's verdict and saves=, the convert= line, the Steam ID.
@@ -84,6 +87,7 @@ local fake_link={
     mode=function() return link_mode end,
     saves=function() return saves_info end,
     fight=function() fight_reads=fight_reads+1; return fight_text end,
+    pilot=function() pilot_reads=pilot_reads+1; return pilot_text end,
     chatting=function() return chatting end,
     take_chat=function() chat_takes=chat_takes+1; local lines=chat_lines; chat_lines={}; return lines end,
     say=function(text)
@@ -102,6 +106,7 @@ local fake_link={
     lobby=function() return link_lobby end,
     ping=function() return ping_ms end,
     mate=function() return mate_v end,
+    paks=function() return paks_v end,
     -- coop-settings.txt for the menu: the same text the settings were read from at load.
     settings_text=function() return settings_text end,
     write_settings=function(text)
@@ -290,7 +295,8 @@ package.loaded.version='v9-test'
 local USAGE='Use: coop puppet | host | invite | join [lobby id|code] | copy | allow|deny|remove <SteamID> | leave | '
     ..'status | report | where | loopback '
     ..'<delay ms> <jitter ms> <loss %>|off | record [off] | replay [off] | basesuit | look [cloth|dyes|effects '
-    ..'on|off] | no [heal|rule|spawnpt|actor] | recruiter [off] | fight on|off|status|probe|test|record|replay | '
+    ..'on|off] | no [heal|rule|spawnpt|actor] | recruiter [off] | fight on|off|status|probe|test|record|replay|pilot|'
+    ..'spawn | '
     ..'freeze <seconds>|off | ui reset|off | saves probe|convert|coop|main | off'
 
 local function load_main(with_native)
@@ -328,7 +334,8 @@ assert(chat_new[1]==nil and chat_new[2]==true,'The chat on, as the settings say;
 for k,line in ipairs(printed) do
     if line:find('keys: menu=',1,true) then
         assert(printed[k+1]=='[StellarCoop] look: cloth=off dyes=off effects=off\n','Right after the keys')
-        assert(printed[k+2]=='[StellarCoop] shared enemies: on (experimental), fight_chars auto\n',printed[k+2])
+        assert(printed[k+2]=='[StellarCoop] shared enemies: on (experimental), fight_chars auto, same place off '
+            ..'(experimental), same spawns off (experimental), extra enemies 0\n',printed[k+2])
         assert(printed[k+3]=='[StellarCoop] photo sync: both, longest pause 600 s, ghost in your photos on, its name '
             ..'tag off\n',printed[k+3])
     end
@@ -704,7 +711,7 @@ link_mode='none'
 
 -- coop fight (Phase 11, experimental). Strict arguments: anything else is the fight's usage line and asks nothing.
 local FIGHT_USE='[StellarCoop] STOP: Use: coop fight on | off | status | probe | test hp|sh|st <change> | test kill | '
-    ..'record | replay\n'
+    ..'record | replay | pilot status|probe|on|off | pilot test freeze|cmc|drive|replay|target|exec | spawn probe\n'
 local FIGHT_STOP='[StellarCoop] STOP: coop fight runs only on a co-op save (INSTALL.md: Co-op saves); now '
 local COOP=with_slot('slot=coop index=4 marker=4\n')
 settings_text='shared_enemies=off\n'
@@ -720,14 +727,15 @@ for _,bad in ipairs({{},{'start'},{'ON'},{'on','x'},{'off','now'},{'status','x'}
     assert(last()==FIGHT_USE and #asked==0,table.concat(bad,' ')..': '..last())
 end
 -- shared_enemies=off: coop fight on refuses; the T11a tools still run. fight_chars=auto (the default)
--- asks them with no ids: the native part then takes every common enemy. A test's change goes as a plain whole number;
--- a test never carries fight_chars.
+-- asks them with no ids: the native part then takes every common enemy. record, a mode that hosts, carries the host's
+-- scaling (1.35 and 1.15 by default) in whole percents. A test's change goes as a plain whole number; a test never
+-- carries fight_chars.
 coop('fight','on')
 assert(last()=='[StellarCoop] STOP: shared enemies are off in coop-settings.txt (shared_enemies=off)\n' and #asked==0)
 for _,mode in ipairs({'probe','record','replay'}) do
     coop('fight',mode)
-    assert(asked[#asked]=='fight '..mode and last()=='[StellarCoop] OK: asked the native part: fight '..mode..'\n',
-        last())
+    local line='fight '..mode..(mode=='record' and ' scale 135 115' or '')
+    assert(asked[#asked]==line and last()=='[StellarCoop] OK: asked the native part: '..line..'\n',last())
 end
 for _,case in ipairs({{{'hp','-10'},'fight test hp -10'},{{'hp','+5'},'fight test hp 5'},
         {{'sh','-1'},'fight test sh -1'},{{'st','10000000'},'fight test st 10000000'},
@@ -758,13 +766,62 @@ for _,case in ipairs({{with_slot('slot=main index=0 marker=4\n'),'slot=main inde
 end
 status_text=with_slot('slot=coop index=2 marker=none saves=coop\n')
 coop('fight','probe'); assert(asked[#asked]=='fight probe','The co-op saves pass too')
+-- coop fight pilot (same-place enemies, stages 3a to 3c), on any slot: status asks the native part (which logs its
+-- stats lines at once) and answers with the pilot= line; probe, on, off and test (target and exec too) go as typed.
+-- on needs same_place=on, as on needs shared_enemies=on.
+status_text=with_slot('slot=main index=0 marker=4\n')
+for _,bad in ipairs({{'pilot'},{'pilot','start'},{'pilot','status','x'},{'pilot','probe','1'},{'pilot','off','now'},
+        {'pilot','on','x'},{'pilot','test'},{'pilot','test','Freeze'},{'pilot','test','freeze','x'},
+        {'pilot','tests','drive'},{'pilot','test','kill'},{'pilot','test','hp','5'},{'pilot','Probe'},
+        {'pilot','test','exec','1'},{'pilot','test','Exec'}}) do
+    local before=#asked
+    coop('fight',table.unpack(bad))
+    assert(last()==FIGHT_USE and #asked==before,table.concat(bad,' ')..': '..last())
+end
+for _,case in ipairs({{{'probe'},'fight pilot probe'},{{'off'},'fight pilot off'},
+        {{'test','freeze'},'fight pilot test freeze'},{{'test','cmc'},'fight pilot test cmc'},
+        {{'test','drive'},'fight pilot test drive'},{{'test','replay'},'fight pilot test replay'},
+        {{'test','target'},'fight pilot test target'},{{'test','exec'},'fight pilot test exec'}}) do
+    coop('fight','pilot',table.unpack(case[1]))
+    assert(asked[#asked]==case[2] and last()=='[StellarCoop] OK: asked the native part: '..case[2]..'\n',last())
+end
+local before_pilot=#asked
+coop('fight','pilot','on')
+assert(#asked==before_pilot and last()=='[StellarCoop] STOP: same place is off in coop-settings.txt (same_place=off)\n',
+    last())
+pilot_text='pilot=on piloted=3 owned=1 drawn=2 probe=on'
+coop('fight','pilot','status')
+assert(asked[#asked]=='fight pilot status'
+    and last()=='[StellarCoop] OK: pilot=on piloted=3 owned=1 drawn=2 probe=on\n',last())
+pilot_text=nil
+coop('fight','pilot','status')
+assert(asked[#asked]=='fight pilot status' and last()=='[StellarCoop] OK: no same-place status yet\n',last())
+-- coop fight spawn probe (same spawns, stage 4): the probe with "spawns", on a co-op save only, as the probe; anything
+-- else is the usage line. Its status is the fight= line's spawns= (coop fight status).
+for _,bad in ipairs({{'spawn'},{'spawn','status'},{'spawn','Probe'},{'spawn','probe','x'},{'spawns','probe'},
+        {'spawn','on'}}) do
+    local before=#asked
+    coop('fight',table.unpack(bad))
+    assert(last()==FIGHT_USE and #asked==before,table.concat(bad,' ')..': '..last())
+end
+do
+    local before_spawn=#asked
+    coop('fight','spawn','probe')
+    assert(#asked==before_spawn and last()==FIGHT_STOP..'slot=main index=0 marker=4\n',last())
+end
+status_text=with_slot('slot=coop index=2 marker=none saves=coop\n')
+coop('fight','spawn','probe')
+assert(asked[#asked]=='fight probe spawns' and last()=='[StellarCoop] OK: asked the native part: fight probe spawns\n',
+    last())
 -- shared_enemies=on with fight_chars: every mode but test carries them. coop fight on runs on any save: the native
 -- part waits for a co-op save, and says what it waits for. It starts by itself once a load, as soon as the native part
 -- judged the slot (coop, main, or none at the title), not before (no slot line, unknown), never again.
 settings_text='shared_enemies=on\nfight_chars=15011001 2\n'
 status_text=plain
 load_main(true)
-assert(logged('shared enemies: on (experimental), fight_chars 15011001 2'),table.concat(printed,'|'))
+assert(logged('shared enemies: on (experimental), fight_chars 15011001 2, same place off (experimental), same spawns '
+    ..'off (experimental), extra enemies 0'),
+    table.concat(printed,'|'))
 for _,waiting in ipairs({plain,with_slot('slot=unknown index=? marker=4\n'),
         with_slot('friend=1 0 slot=coop index=4 marker=4\n')}) do
     status_text=waiting; loops[2].f(); assert(#asked==0,'No save judged yet: it waits')
@@ -773,17 +830,96 @@ for _,judged in ipairs({COOP,with_slot('slot=main index=0 marker=4\n'),with_slot
     load_main(true)
     status_text=judged
     loops[2].f()
-    assert(#asked==1 and asked[1]=='fight on 15011001 2'
-        and logged('OK: shared_enemies=on: asked the native part: fight on 15011001 2'),table.concat(printed,'|'))
+    assert(#asked==1 and asked[1]=='fight on scale 135 115 15011001 2'
+        and logged('OK: shared_enemies=on: asked the native part: fight on scale 135 115 15011001 2'),
+        table.concat(printed,'|'))
     loops[2].f(); status_text=with_slot('slot=none index=4 marker=4\n'); loops[2].f(); status_text=COOP; loops[2].f()
     assert(#asked==1,'Once a load: a reload of the save asks nothing (the native part waits and resumes)')
 end
 for _,mode in ipairs({'on','probe','record','replay'}) do
-    coop('fight',mode); assert(asked[#asked]=='fight '..mode..' 15011001 2',asked[#asked])
+    coop('fight',mode)
+    assert(asked[#asked]=='fight '..mode..((mode=='on' or mode=='record') and ' scale 135 115' or '')..' 15011001 2',
+        asked[#asked])
 end
 coop('fight','test','kill'); assert(asked[#asked]=='fight test kill')
 status_text=with_slot('slot=main index=0 marker=4\n')
-coop('fight','on'); assert(asked[#asked]=='fight on 15011001 2','By hand on your own save: the native part waits')
+coop('fight','on')
+assert(asked[#asked]=='fight on scale 135 115 15011001 2','By hand on your own save: the native part waits')
+-- guest_kills=confirmed and kill_credit=fought go with the modes that kill on the other side's word (on, replay), as
+-- one word each before the ids, in that order; the others never carry them. The host's scaling goes with the modes
+-- that host (on, record), after them: each 1.0 to 4.0 setting as whole percents, rounded.
+settings_text='shared_enemies=on\nguest_kills=confirmed\nkill_credit=fought\nenemy_hp_scale=2\nenemy_balance_scale=1\n'
+load_main(true)
+status_text=COOP
+for _,case in ipairs({{'on','fight on confirmed fought scale 200 100'},{'replay','fight replay confirmed fought'},
+        {'probe','fight probe'},{'record','fight record scale 200 100'}}) do
+    coop('fight',case[1]); assert(asked[#asked]==case[2],asked[#asked])
+end
+settings_text='shared_enemies=on\nkill_credit=FOUGHT\nenemy_hp_scale=1.234\nenemy_balance_scale=1.006\n'
+load_main(true)
+status_text=COOP
+coop('fight','on'); assert(asked[#asked]=='fight on fought scale 123 101',asked[#asked])
+-- same_place=on goes with the modes that can host (on, record) as "place" after the scaling, before the ids; the
+-- guest takes the host's, so replay and probe never carry it. coop fight pilot on then runs.
+settings_text='shared_enemies=on\nsame_place=on\nfight_chars=15011001 2\n'
+load_main(true)
+assert(logged('shared enemies: on (experimental), fight_chars 15011001 2, same place on (experimental), same spawns '
+    ..'off (experimental), extra enemies 0'),
+    table.concat(printed,'|'))
+status_text=COOP
+loops[2].f()
+assert(#asked==1 and asked[1]=='fight on scale 135 115 place 15011001 2',asked[1])
+for _,case in ipairs({{'record','fight record scale 135 115 place 15011001 2'},{'replay','fight replay 15011001 2'},
+        {'probe','fight probe 15011001 2'}}) do
+    coop('fight',case[1]); assert(asked[#asked]==case[2],asked[#asked])
+end
+coop('fight','pilot','on'); assert(asked[#asked]=='fight pilot on')
+-- aggro=host (the host's: enemies fight the host only) goes the same way as "aggro-host" after place, or alone.
+settings_text='shared_enemies=on\nsame_place=on\naggro=host\n'
+load_main(true)
+status_text=COOP
+for _,case in ipairs({{'on','fight on scale 135 115 place aggro-host'},{'record','fight record scale 135 115 place '
+        ..'aggro-host'},{'replay','fight replay'},{'probe','fight probe'}}) do
+    coop('fight',case[1]); assert(asked[#asked]==case[2],asked[#asked])
+end
+settings_text='shared_enemies=on\naggro=HOST\n'
+load_main(true)
+status_text=COOP
+coop('fight','on'); assert(asked[#asked]=='fight on scale 135 115 aggro-host',asked[#asked])
+-- same_spawns=on (the host's) goes with on only, as "spawns" after aggro-host, before the ids: the other modes have no
+-- guest to answer.
+settings_text='shared_enemies=on\nsame_place=on\naggro=host\nsame_spawns=on\nfight_chars=15011001\n'
+load_main(true)
+status_text=COOP
+assert(logged('shared enemies: on (experimental), fight_chars 15011001, same place on (experimental), same spawns on '
+    ..'(experimental), extra enemies 0'),table.concat(printed,'|'))
+for _,case in ipairs({{'on','fight on scale 135 115 place aggro-host spawns 15011001'},{'record','fight record scale '
+        ..'135 115 place aggro-host 15011001'},{'replay','fight replay 15011001'},{'probe','fight probe 15011001'}}) do
+    coop('fight',case[1]); assert(asked[#asked]==case[2],asked[#asked])
+end
+-- coop fight spawn probe: the probe with "spawns" before the ids, whatever same_spawns says.
+coop('fight','spawn','probe'); assert(asked[#asked]=='fight probe spawns 15011001',asked[#asked])
+settings_text='shared_enemies=on\nsame_spawns=on\n'
+load_main(true)
+status_text=COOP
+coop('fight','on'); assert(asked[#asked]=='fight on scale 135 115 spawns',asked[#asked])
+-- enemy_extra (the host's) goes with spawns only, as "extra" and its number after it; 0 or same_spawns=off: none.
+settings_text='shared_enemies=on\nsame_spawns=on\nenemy_extra=2\nfight_chars=15011001\n'
+load_main(true)
+status_text=COOP
+assert(logged('shared enemies: on (experimental), fight_chars 15011001, same place off (experimental), same spawns on '
+    ..'(experimental), extra enemies 2'),table.concat(printed,'|'))
+for _,case in ipairs({{'on','fight on scale 135 115 spawns extra 2 15011001'},{'record','fight record scale 135 115 '
+        ..'15011001'},{'replay','fight replay 15011001'},{'probe','fight probe 15011001'}}) do
+    coop('fight',case[1]); assert(asked[#asked]==case[2],asked[#asked])
+end
+for _,text in ipairs({'shared_enemies=on\nenemy_extra=3\n','shared_enemies=on\nsame_spawns=on\nenemy_extra=0\n'}) do
+    settings_text=text
+    load_main(true)
+    status_text=COOP
+    coop('fight','on'); assert(not asked[#asked]:find('extra',1,true),asked[#asked])
+end
+settings_text='shared_enemies=on\nfight_chars=15011001 2\n'
 -- coop fight off cancels the start to come; coop off too.
 load_main(true)
 status_text=plain; coop('fight','off'); status_text=COOP; loops[2].f()
@@ -796,16 +932,20 @@ for _,text in ipairs({'','shared_enemies=on\n','shared_enemies=on\nfight_chars=a
         'shared_enemies=on\nfight_chars=\n'}) do
     settings_text=text
     load_main(true)
-    assert(logged('shared enemies: on (experimental), fight_chars auto'),table.concat(printed,'|'))
+    assert(logged('shared enemies: on (experimental), fight_chars auto, same place off (experimental), same spawns '
+        ..'off (experimental), extra enemies 0'),
+        table.concat(printed,'|'))
     status_text=COOP; loops[2].f()
-    assert(#asked==1 and asked[1]=='fight on',text)
+    assert(#asked==1 and asked[1]=='fight on scale 135 115',text)
 end
 -- And never with shared_enemies=off.
 settings_text='shared_enemies=off\n'
 load_main(true)
 loops[2].f(); assert(#asked==0)
 -- shared_enemies=off at a reload (Ctrl+R) ends a coop fight on an earlier load started, waiting or running, from the
--- fight= line at a line start only; a probe, record or replay goes on, and nothing is asked after coop off.
+-- fight= line at a line start only; a probe, record or replay goes on, and nothing is asked after coop off. (With
+-- same_place=on: same_place=off has its own reload ask, below.)
+settings_text='shared_enemies=off\nsame_place=on\n'
 local ON_LINE='fight=on mode=on role=host enemies=3 claims=0 refused=0 kills=0 floored=0 sim_us=9/20 threads=1/1/2\n'
 for _,case in ipairs({{with_slot(ON_LINE),true},{with_slot('fight=waiting mode=on why=no friend linked\n'),true},
         {with_slot('fight=waiting mode=on her=off why=not on a co-op save\n'),true},
@@ -825,6 +965,32 @@ end
 settings_text='shared_enemies=on\nfight_chars=15011001 2\n'
 status_text=with_slot(ON_LINE)
 load_main(true); assert(#asked==0,'shared_enemies=on leaves it running')
+settings_text=''
+-- same_place=off (the default) at a reload asks coop fight pilot off on the side that hosts, running or waiting: coop
+-- fight on while the link hosts, or record. Never as guest or unlinked for on, never for a probe or replay, nor after
+-- coop off; same_place=on leaves it.
+local function hosted(line) return (with_slot(line):gsub('\nlink=none lobby=0\n','\nlink=host lobby=7\n')) end
+for _,case in ipairs({{hosted(ON_LINE),true},{hosted('fight=waiting mode=on her=off why=not on a co-op save\n'),true},
+        {with_slot('fight=on mode=record role=host enemies=1 claims=0 refused=0 kills=0 floored=0 sim_us=9/20 '
+            ..'threads=1/1/2\n'),true},
+        {with_slot('fight=waiting mode=record why=no save loaded\n'),true},
+        {with_slot('fight=waiting mode=on why=no friend linked\n'),false},
+        {(with_slot('fight=on mode=on role=guest pairs=2 claims=0 corrections=0 kills=0 floored=0\n')
+            :gsub('link=none lobby=0','link=guest lobby=7')),false},
+        {hosted('fight=on mode=probe actors=12 eve=1 turn=40 turns_per_s=60 writes=armed sim_us=8/30 threads=1/1/2\n'),
+            false},
+        {hosted('fight=waiting mode=replay why=no save loaded\n'),false},
+        {hosted('fight=off why=coop fight off\n'),false},{hosted('peer=2 name=x '..ON_LINE),false},
+        {'mod=v proto=3 steam=ready\nlink=host lobby=7\nengine=off reason=coop_off\n'..ON_LINE,false}}) do
+    status_text=case[1]
+    load_main(true)
+    assert(#asked==(case[2] and 1 or 0) and (not case[2] or asked[1]=='fight pilot off'),case[1])
+    assert(not case[2] or logged('OK: same_place=off: asked the native part: fight pilot off'),
+        table.concat(printed,'|'))
+end
+settings_text='same_place=on\n'
+status_text=hosted(ON_LINE)
+load_main(true); assert(#asked==0,'same_place=on leaves it running')
 settings_text=''
 -- The notices, every 250 ms from the fight= line: on when its enemies go from none to some (one enemy, or several);
 -- off once it ran or waited, in any mode, but not when our own player ended it (coop fight off, coop off); a latch
@@ -875,8 +1041,71 @@ for _,step in ipairs({
     local got=fight_step(step[1])
     assert(got==step[2],tostring(step[1])..': '..got)
 end
--- The same notices in the game's language (French: 0 and 1 singular).
+-- With the host's scaling (the line's scale=, which the guest has from the host's scale line), the on notice names it;
+-- 100 % and 100 % add nothing.
+for _,step in ipairs({{'fight=off why=coop fight off',''},
+        {'fight=on mode=on role=guest pairs=2 claims=0 corrections=0 kills=0 floored=0 desync=0 scale=135/115 '
+            ..'sim_us=5/9 threads=1/1/2',"Shared enemies on: 2 enemies linked. Enemy HP 135 %, balance 115 % (the "
+            .."host's setting)."},
+        {'fight=off why=coop fight off',''},
+        {'fight=on mode=on role=host enemies=1 claims=0 refused=0 kills=0 floored=0 scale=100/100 sim_us=9/20 '
+            ..'threads=1/1/2','Shared enemies on: 1 enemy linked.'}}) do
+    local got=fight_step(step[1])
+    assert(got==step[2],tostring(step[1])..': '..got)
+end
+-- Her .pak mods against ours: one notice when they differ, until the session ends (no link); the same say nothing.
+local function paks_tick(v)
+    paks_v=v
+    local n,out=#said,{}
+    loops[2].f()
+    for i=n+1,#said do if said[i]:find('.pak',1,true) then out[#out+1]=said[i] end end
+    return table.concat(out,'|')
+end
+local PAKS='Kaanta loads other .pak mods than you (1 there, 2 here). Enemies that differ stay unshared.'
+link_mode='host'
+assert(paks_tick(nil)=='' and paks_tick({same=true,ours=2,hers=2})=='')
+assert(paks_tick({same=false,ours=2,hers=1})==PAKS and paks_tick({same=false,ours=2,hers=1})=='')
+link_mode='none'
+assert(paks_tick(nil)=='')
+link_mode,kit_language='guest','fr-FR'
+assert(paks_tick({same=false,ours=0,hers=3})=="Kaanta n'a pas les mêmes mods .pak que vous (3 en face, 0 ici). Les "
+    ..'ennemis qui diffèrent ne sont pas partagés.')
+link_mode,kit_language='none',nil
+paks_tick(nil)
+-- Sharing as the guest: once when the host has enemies we cannot pair for their MaxHP (until it stops or the friend
+-- leaves); each time the host goes down while enemies are linked (her vitals: HP 0, or a life state 3-5).
+local GUEST_ON='fight=on mode=on role=guest claims=0 corrections=0 kills=0 floored=0 desync=0 unpaired=1 sim_us=5/9 '
+    ..'threads=1/1/2 pairs='
+local MAXHP="Shared enemies: some enemies have another max HP in Kaanta's game (another difficulty or New Game+). They "
+    ..'stay unshared.'
+local DOWN='Shared enemies: Kaanta is down. Once they respawn, the enemies you share go back to full health.'
+local function vitals(hp,life) return {hp=hp,max_hp=1000,life=life} end
+for _,step in ipairs({{'fight=off why=coop fight off',''},
+        {GUEST_ON..'2 maxhp=0','Shared enemies on: 2 enemies linked.'},
+        {GUEST_ON..'2 maxhp=1',MAXHP},{GUEST_ON..'2 maxhp=2',''},
+        {GUEST_ON..'2 maxhp=2',DOWN,vitals(0,1)},{GUEST_ON..'2 maxhp=2','',vitals(0,1)},
+        {GUEST_ON..'2 maxhp=2','',vitals(1000,1)},{GUEST_ON..'2 maxhp=2',DOWN,vitals(500,3)},
+        {GUEST_ON..'0 maxhp=2','',vitals(1000,1)},{GUEST_ON..'0 maxhp=2','',vitals(0,1)}, -- None linked: nothing.
+        {'fight=waiting mode=on why=photo mode',''},{GUEST_ON..'0 maxhp=2',''},
+        {'fight=waiting mode=on why=no friend linked',''},{GUEST_ON..'0 maxhp=1',MAXHP},
+        {'fight=off why=coop fight off',''},{GUEST_ON..'1 maxhp=1','Shared enemies on: 1 enemy linked.|'..MAXHP},
+        {'fight=on mode=on role=host enemies=2 claims=0 refused=0 kills=0 floored=0 sim_us=9/20 threads=1/1/2','',
+            vitals(0,3)}, -- The host hears nothing of either.
+        {'fight=off why=coop fight off',''}}) do
+    mate_v=step[3]
+    local got=fight_step(step[1])
+    assert(got==step[2],tostring(step[1])..': '..got)
+end
+mate_v=nil
 kit_language='fr-FR'
+assert(fight_step(GUEST_ON..'1 maxhp=1')=="Ennemis partagés actifs : 1 ennemi lié.|Ennemis partagés : certains "
+    .."ennemis ont d'autres PV max dans la partie de Kaanta (autre difficulté ou New Game+). Ils ne sont pas partagés.")
+mate_v=vitals(0,3)
+assert(fight_step(GUEST_ON..'1 maxhp=1')=='Ennemis partagés : Kaanta est à terre. Après sa réapparition, vos '
+    ..'ennemis partagés reviennent à pleine santé.')
+mate_v=nil
+fight_step('fight=off why=coop fight off')
+-- The same notices in the game's language (French: 0 and 1 singular).
 local HOST_N='fight=on mode=on role=host claims=0 refused=0 kills=0 floored=0 sim_us=9/20 threads=1/1/2 enemies='
 for _,step in ipairs({{'fight=off why=coop fight off',''},{HOST_N..'0',''},
         {HOST_N..'3','Ennemis partagés actifs : 3 ennemis liés.'},
@@ -884,7 +1113,9 @@ for _,step in ipairs({{'fight=off why=coop fight off',''},{HOST_N..'0',''},
         {HOST_N..'1','Ennemis partagés actifs : 1 ennemi lié.'},
         {'fight=off why=coop fight off',''},
         {'fight=waiting mode=on why=no friend linked',''},
-        {'fight=off','Ennemis partagés coupés. coop-link.log dit pourquoi.'}}) do
+        {'fight=off','Ennemis partagés coupés. coop-link.log dit pourquoi.'},
+        {HOST_N..'2 scale=150/100',"Ennemis partagés actifs : 2 ennemis liés. PV des ennemis 150 %, équilibre 100 % "
+            .."(réglage de l'hôte)."},{'fight=off why=coop fight off',''}}) do
     fight_text=step[1]
     local n=#said
     loops[2].f()
@@ -898,6 +1129,110 @@ loops[1].f(); loops[1].f(); assert(fight_reads==reads,'No shared fight work in t
 local languages=language_reads
 fight_step('fight=stopped why=fault')
 assert(language_reads==languages,'The language is read only to say a notice')
+-- Same place's notices (stage 3a), every 250 ms from the pilot= line, in the menu's language: on with the count when
+-- its enemies go from none to some; off with why once it was on, when the host's game turned it off or an error
+-- stopped it; never for our own coop fight pilot off (why=asked), the host's own setting (why=setting) or the shared
+-- fight not running (why=fight: its own notices say so), nor for a status that was not read; nothing per frame.
+local function pilot_step(text)
+    pilot_text=text
+    local n,out=#said,{}
+    loops[2].f()
+    for i=n+1,#said do
+        if said[i]:find('^Same place') or said[i]:find('^Même position') then out[#out+1]=said[i] end
+    end
+    return table.concat(out,'|')
+end
+local OFF_BY_ERROR='Same place off: stopped by an error until the game restarts. coop-link.log says why.'
+for _,step in ipairs({{nil,''},{'pilot=off why=fight',''},{'pilot=off why=host',''},{'pilot=on piloted=0',''},
+        {'pilot=on piloted=3','Same place: 3 enemies piloted.'},{'pilot=on piloted=2',''},{'pilot=on piloted=0',''},
+        {'pilot=on piloted=1','Same place: 1 enemy piloted.'},{nil,''},
+        {'pilot=off why=host',"Same place off: Kaanta's game turned it off."},{'pilot=off why=host',''},
+        {'pilot=on piloted=2 probe=on','Same place: 2 enemies piloted.'},{'pilot=off why=asked',''},
+        {'pilot=on piloted=2 test=cmc','Same place: 2 enemies piloted.'},{'pilot=off why=fight',''},
+        {'pilot=on piloted=2','Same place: 2 enemies piloted.'},{'pilot=off why=setting',''},
+        {'pilot=on piloted=0',''},{'pilot=off why=host',"Same place off: Kaanta's game turned it off."},
+        {'pilot=on piloted=1','Same place: 1 enemy piloted.'},{'pilot=stopped',OFF_BY_ERROR},{'pilot=stopped',''},
+        {'pilot=refused why=coop off',''}}) do
+    local got=pilot_step(step[1])
+    assert(got==step[2],tostring(step[1])..': '..got)
+end
+kit_language='fr-FR'
+for _,step in ipairs({{'pilot=on piloted=3','Même position : 3 ennemis pilotés.'},
+        {'pilot=off why=host',"Même position coupée : la partie de Kaanta l'a désactivée."},
+        {'pilot=on piloted=1','Même position : 1 ennemi piloté.'},
+        {'pilot=stopped',"Même position coupée : arrêtée par une erreur jusqu'au redémarrage du jeu. coop-link.log dit "
+            ..'pourquoi.'}}) do
+    local got=pilot_step(step[1])
+    assert(got==step[2],tostring(step[1])..': '..got)
+end
+kit_language=nil
+friend_name=''
+pilot_step('pilot=on piloted=1')
+assert(pilot_step('pilot=off why=host')=="Same place off: your friend's game turned it off.")
+friend_name='Kaanta'
+pilot_step(nil)
+local pilots=pilot_reads
+loops[1].f(); loops[1].f(); assert(pilot_reads==pilots,'No same-place work in the per-frame loop')
+-- Same spawns' notices (stage 4), every 250 ms from the fight= line while coop fight on runs, in the menu's language:
+-- on once a session when its spawns= first reads on, in the host's words or the guest's; stopped once when it reads
+-- stopped (the same-place error stops same spawns too); as guest, once a session when its spawns_differ= first counts
+-- an enemy. Nothing for spawns=off or a probe. Shared enemies off or stopped, or the friend gone, forget them.
+do
+    local function spawn_step(text)
+        fight_text=text
+        local n,out=#said,{}
+        loops[2].f()
+        for i=n+1,#said do
+            if said[i]:find('^Same spawns') or said[i]:find('^Mêmes apparitions') then out[#out+1]=said[i] end
+        end
+        return table.concat(out,'|')
+    end
+    local SP_HOST='fight=on mode=on role=host enemies=2 claims=0 refused=0 kills=0 floored=0 spawns='
+    local SP_GUEST='fight=on mode=on role=guest pairs=2 claims=0 corrections=0 kills=0 floored=0 desync=0 unpaired=0 '
+        ..'maxhp=0 spawns='
+    local SP_TAIL=' scale=135/115 sim_us=9/20 threads=1/1/2'
+    local SP_ON_HOST='Same spawns on: where you and Kaanta stand within 100 m of each other in one zone, their game '
+        ..'holds the same common enemies as yours.'
+    local SP_ON_GUEST='Same spawns on: where you and Kaanta stand within 100 m of each other in one zone, your game '
+        ..'holds the same common enemies as theirs.'
+    local SP_STOPPED='Same spawns stopped by an error until the game restarts. coop-link.log says why.'
+    local SP_DIFFER="Same spawns: some enemies differ between your game and Kaanta's (other .pak mods or "
+        ..'fight_chars) and stay as they are. coop-link.log names them.'
+    for _,step in ipairs({{nil,''},{SP_HOST..'off'..SP_TAIL,''},{SP_HOST..'on'..SP_TAIL,SP_ON_HOST},
+            {SP_HOST..'on'..SP_TAIL,''},{SP_HOST..'off'..SP_TAIL,''},{SP_HOST..'on'..SP_TAIL,''},
+            {SP_HOST..'stopped'..SP_TAIL,SP_STOPPED},{SP_HOST..'stopped'..SP_TAIL,''},
+            {'fight=off why=coop fight off',''},
+            {'fight=on mode=probe actors=12 eve=1 turn=40 turns_per_s=60 writes=armed spawns=probe sim_us=8/30 '
+                ..'threads=1/1/2',''},
+            {SP_GUEST..'off'..SP_TAIL,''},
+            {SP_GUEST..'on spawned=0 despawned=0 spawns_differ=0'..SP_TAIL,SP_ON_GUEST},
+            {SP_GUEST..'on spawned=3 despawned=1 spawns_differ=0'..SP_TAIL,''},
+            {SP_GUEST..'off'..SP_TAIL,''}, -- The host's map loads: its next epoch line turns it on again.
+            {SP_GUEST..'on spawned=3 despawned=1 spawns_differ=2'..SP_TAIL,SP_DIFFER},
+            {SP_GUEST..'on spawned=3 despawned=1 spawns_differ=3'..SP_TAIL,''},
+            {'fight=waiting mode=on why=no friend linked',''},
+            {SP_GUEST..'on spawned=0 despawned=0 spawns_differ=1'..SP_TAIL,SP_ON_GUEST..'|'..SP_DIFFER},
+            {'fight=stopped why=fault',''}}) do
+        local got=spawn_step(step[1])
+        assert(got==step[2],tostring(step[1])..': '..got)
+    end
+    kit_language='fr-FR'
+    for _,step in ipairs({{SP_HOST..'on'..SP_TAIL,"Mêmes apparitions actives : là où vous et Kaanta êtes à moins de "
+                .."100 m l'un de l'autre dans une même zone, sa partie a les mêmes ennemis communs que la vôtre."},
+            {SP_HOST..'stopped'..SP_TAIL,"Mêmes apparitions arrêtées par une erreur jusqu'au redémarrage du jeu. "
+                ..'coop-link.log dit pourquoi.'},
+            {'fight=off why=coop fight off',''},
+            {SP_GUEST..'on spawned=0 despawned=0 spawns_differ=1'..SP_TAIL,"Mêmes apparitions actives : là où vous et "
+                .."Kaanta êtes à moins de 100 m l'un de l'autre dans une même zone, votre partie a les mêmes ennemis "
+                ..'communs que la sienne.|Mêmes apparitions : certains ennemis diffèrent entre votre partie et celle de '
+                ..'Kaanta (autres mods .pak ou fight_chars) et restent tels quels. coop-link.log les nomme.'},
+            {'fight=off why=coop fight off',''}}) do
+        local got=spawn_step(step[1])
+        assert(got==step[2],tostring(step[1])..': '..got)
+    end
+    kit_language=nil
+    fight_text=nil
+end
 -- What keeps coop fight on from sharing, one notice each time it changes: your own save (how to switch to the co-op
 -- copy, or the manual slot when the co-op copies are off), her own save, her shared enemies off or stopped, the two of
 -- you on different maps. Waits that end by themselves (no friend, a load, photo mode) say nothing and forget nothing;
@@ -982,14 +1317,20 @@ link_mode,saves_info,settings_text='none',{},''
 fight_text=nil
 status_text=plain
 local Words=require('ui_text') -- Both languages complete.
-for k in pairs(Words.en.fight) do assert(Words.fr.fight[k],k) end
-for k in pairs(Words.fr.fight) do assert(Words.en.fight[k],k) end
+for _,group in ipairs({'fight','spawns'}) do
+    for k in pairs(Words.en[group]) do assert(Words.fr[group][k],group..'.'..k) end
+    for k in pairs(Words.fr[group]) do assert(Words.en[group][k],group..'.'..k) end
+end
 -- Every notice fits the feed's 200 bytes a line (Chat.clean cuts the rest) with a 32-character Steam name.
 for _,lang in ipairs({'en','fr'}) do
-    for k,text in pairs(Words[lang].fight) do
-        local full=text:gsub('%%s',string.rep('W',32)):gsub('%%d','16')
-        assert(Chat.clean(full)==full,lang..'.fight.'..k..': '..#full..' bytes')
+    for _,group in ipairs({'fight','spawns'}) do
+        for k,text in pairs(Words[lang][group]) do
+            local full=text:gsub('%%s',string.rep('W',32)):gsub('%%d','16')
+            assert(Chat.clean(full)==full,lang..'.'..group..'.'..k..': '..#full..' bytes')
+        end
     end
+    local scaled=Words[lang].fight.on:format(16)..' '..Words[lang].fight.scale:format(200,200) -- The longest on.
+    assert(Chat.clean(scaled)==scaled,lang..': '..#scaled..' bytes')
 end
 
 -- The co-op menu (menu.lua, ui_model.lua and ui_text.lua for real; the kit faked). menu_key opens it in a world only,
@@ -1132,7 +1473,8 @@ to('Shared enemies (experimental)'); assert(select(2,focus())=='On')
 quarter(); assert(#asked==fight_asks,'No slot line yet: it waits')
 status_text=with_slot('slot=main index=0 marker=4\n')
 quarter()
-assert(#asked==fight_asks+1 and asked[#asked]=='fight on' and logged('OK: shared_enemies=on: asked the native part: fight on'))
+assert(#asked==fight_asks+1 and asked[#asked]=='fight on scale 135 115'
+    and logged('OK: shared_enemies=on: asked the native part: fight on scale 135 115'))
 quarter(); assert(#asked==fight_asks+1,'Once')
 fight_text='fight=waiting mode=on why=not on a co-op save (slot=main index=0 marker=4)'
 key('RETURN')
@@ -1143,9 +1485,58 @@ assert(#asked==fight_asks+2 and asked[#asked]=='fight off'
     and logged('OK: shared_enemies=off: asked the native part: fight off'))
 quarter(); assert(#asked==fight_asks+2,'Once')
 fight_text='fight=on mode=probe actors=12 eve=1 turn=40 turns_per_s=60 writes=armed sim_us=8/30 threads=1/1/2'
-key('RETURN'); quarter(); assert(#asked==fight_asks+3 and asked[#asked]=='fight on')
+key('RETURN'); quarter(); assert(#asked==fight_asks+3 and asked[#asked]=='fight on scale 135 115')
 key('RETURN'); quarter(); assert(#asked==fight_asks+3 and select(2,focus())=='Off','The probe goes on')
 fight_text=nil
+-- The host's scaling in percent, 5 a step, written as the file holds it; kill credit a choice. Neither asks anything:
+-- each counts from the next start of shared enemies.
+to("Enemy HP (host's)"); assert(select(2,focus())=='135 %')
+key('RIGHT_ARROW')
+assert(settings_text:find('\nenemy_hp_scale=1.4\n',1,true) and select(2,focus())=='140 %' and #asked==fight_asks+3)
+to("Enemy balance (host's)"); key('LEFT_ARROW')
+assert(settings_text:find('\nenemy_balance_scale=1.1\n',1,true) and select(2,focus())=='110 %')
+to('My kill rewards'); assert(select(2,focus())=='Every shared enemy')
+key('RETURN')
+assert(settings_text:find('\nkill_credit=fought\n',1,true) and select(2,focus())=='Enemies I hit'
+    and #asked==fight_asks+3)
+quarter(); assert(#asked==fight_asks+3)
+-- Same place, the host's for both games: Off by default. While a mode that pairs (on, record, replay) waits or runs,
+-- off asks coop fight pilot off at once and on asks coop fight pilot on; with none, or a probe, nothing (the next
+-- coop fight on carries it).
+to('Same place (experimental)'); assert(select(2,focus())=='Off')
+key('RETURN')
+assert(settings_text:find('\nsame_place=on\n',1,true) and select(2,focus())=='On')
+quarter(); assert(#asked==fight_asks+3,'No mode asked: the next coop fight on carries it')
+fight_text='fight=on mode=on role=host enemies=2 claims=0 refused=0 kills=0 floored=0 sim_us=9/20 threads=1/1/2'
+quarter(); assert(#asked==fight_asks+3,'Only a change asks')
+key('RETURN'); quarter()
+assert(settings_text:find('\nsame_place=off\n',1,true) and #asked==fight_asks+4 and asked[#asked]=='fight pilot off'
+    and logged('OK: same_place=off: asked the native part: fight pilot off'))
+quarter(); assert(#asked==fight_asks+4,'Once')
+fight_text='fight=waiting mode=record why=no save loaded'
+key('RETURN'); quarter()
+assert(#asked==fight_asks+5 and asked[#asked]=='fight pilot on'
+    and logged('OK: same_place=on: asked the native part: fight pilot on'))
+fight_text='fight=on mode=probe actors=12 eve=1 turn=40 turns_per_s=60 writes=armed sim_us=8/30 threads=1/1/2'
+key('RETURN'); quarter(); assert(#asked==fight_asks+5 and select(2,focus())=='Off','The probe: nothing')
+fight_text=nil
+-- Who same-place enemies fight, the host's: Both players (aggro=game) by default, The host only (aggro=host); the
+-- next start of shared enemies carries it, so the row asks nothing.
+to("Enemies attack (host's)"); assert(select(2,focus())=='Both players')
+key('RETURN')
+assert(settings_text:find('\naggro=host\n',1,true) and select(2,focus())=='The host only')
+quarter(); assert(#asked==fight_asks+5,'The next start carries it')
+-- Same spawns, the host's for both games: Off by default; the next start of shared enemies carries it, so the row asks
+-- nothing either.
+to('Same spawns (experimental)'); assert(select(2,focus())=='Off')
+key('RETURN')
+assert(settings_text:find('\nsame_spawns=on\n',1,true) and select(2,focus())=='On')
+loops[2].f(); assert(#asked==fight_asks+5,'The next start carries it') -- The clock left as it is for the frame time.
+-- Extra enemies, the host's: 0 by default, 0 to 3, also from the next start.
+to("Extra enemies (host's)"); assert(select(2,focus())=='0')
+key('RIGHT_ARROW')
+assert(settings_text:find('\nenemy_extra=1\n',1,true) and select(2,focus())=='1')
+loops[2].f(); assert(#asked==fight_asks+5,'The next start carries it')
 status_text=plain
 to('Menu size'); key('RIGHT_ARROW'); assert(kit_calls[#kit_calls]=='scale 105' and select(2,focus())=='105 %')
 to('Menu sounds'); key('Q'); assert(kit_calls[#kit_calls]=='sounds false')
@@ -1153,7 +1544,7 @@ to('Menu sounds'); key('Q'); assert(kit_calls[#kit_calls]=='sounds false')
 kit_language='fr-FR'
 to('Menu language'); key('RIGHT_ARROW')
 assert(focus()=='Menu language' and select(2,focus())=='English','ui_language=english: English whatever the game')
-assert(screen():find('^GHOST||disabled\n') and select(2,screen():gsub('\n',''))==14,'Scrolled: 15 rows')
+assert(screen():find('^SAVES||disabled\n') and select(2,screen():gsub('\n',''))==14,'Scrolled: 15 rows')
 key('RIGHT_ARROW')
 assert(focus()=='Langue du menu' and select(2,focus())=='Langue du jeu' and menu_view.hints[1].s=='Déplacer')
 assert(menu_view.status.s:find('^Co%-op : aucune session en cours%.'),menu_view.status.s)

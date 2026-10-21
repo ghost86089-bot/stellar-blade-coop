@@ -123,6 +123,30 @@ link.changes()
 files[STATUS]=nil
 link.changes()
 assert(link.fight()==nil,'No status: none either')
+-- Same-place enemies' line (stage 3a), likewise from the start of its own line only; nil without one.
+files[STATUS]='mod=v\npeer=2 name=x pilot=on piloted=9\nfight=off\npilot=on piloted=3 probe=on\nlast=#10 x\n'
+link.changes()
+assert(link.pilot()=='pilot=on piloted=3 probe=on',tostring(link.pilot()))
+files[STATUS]='mod=v\r\npilot=refused why=build stamp 0 (not the pinned game)\r\nlast=#11 x\r\n'
+link.changes()
+assert(link.pilot()=='pilot=refused why=build stamp 0 (not the pinned game)','CRLF')
+files[STATUS]='mod=v\npeer=2 name=x pilot=on piloted=1\nlast=pilot=on piloted=1\n'
+link.changes()
+assert(link.pilot()==nil,'Not from a peer line nor from the last line')
+files[STATUS]=nil
+link.changes()
+assert(link.pilot()==nil,'No status: none either')
+-- Her .pak mods against ours (paks=same|differ <ours> <hers>), from the start of its own line only; nil without one.
+files[STATUS]='mod=v\npeer=2 name=x paks=same 1 1\npaks=differ 2 0\nlast=#9 x\n'
+link.changes()
+local paks=link.paks()
+assert(paks and paks.same==false and paks.ours==2 and paks.hers==0)
+files[STATUS]='mod=v\npaks=same 3 3\n'
+link.changes()
+assert(link.paks().same and link.paks().ours==3)
+files[STATUS]='mod=v\npeer=2 name=x paks=differ 1 2\npaks=odd\n'
+link.changes()
+assert(link.paks()==nil,'Not from a peer line, nor a line of another shape')
 
 assert(link.valid_lobby('109775241234567890') and not link.valid_lobby('12x') and not link.valid_lobby('0'))
 -- A join code as typed (the code box, coop join <code>): either case, the dash after the third character, a space there
@@ -190,10 +214,15 @@ assert(#notes==0 and s.name_tag==false and s.send_rate==25 and s.menu_key.name==
 s,notes=Link.parse_settings('colour=red\n\nnot a setting\n')
 assert(#notes==2 and notes[1]=="settings: line 1: unknown setting 'colour', ignored"
     and notes[2]=="settings: line 3: unknown setting 'not a setting', ignored",notes[1])
-local long='#'..string.rep('x',4088)..'\nsend_rate=25\n' -- The 4096th byte is the r of "send_r": the line is dropped.
-long=long..'#'..string.rep('x',5000-#long-2)..'\n'
+local long='#'..string.rep('x',8184)..'\nsend_rate=25\n' -- The 8192nd byte is the r of "send_r": the line is dropped.
+long=long..'#'..string.rep('x',9000-#long-2)..'\n'
 s,notes=Link.parse_settings(long)
-assert(#long==5000 and s.send_rate==60 and #notes==1 and notes[1]=='settings: only the first 4096 bytes are read',notes[1])
+assert(#long==9000 and s.send_rate==60 and #notes==1 and notes[1]=='settings: only the first 8192 bytes are read',notes[1])
+-- The default file saved with CRLF and five ids in fight_chars is read to its last line (card_details).
+local crlf=Link.DEFAULT:gsub('fight_chars=auto','fight_chars=15011001 15011002 15011003 15011004 15011005')
+crlf=crlf:gsub('card_details=on','card_details=off'):gsub('\n','\r\n')
+s,notes=Link.parse_settings(crlf)
+assert(#notes==0 and s.card_details==false and #crlf>4096,notes[1])
 s,notes=Link.parse_settings('\239\187\191menu_key=F7\n')
 assert(#notes==0 and s.menu_key.name=='F7','A UTF-8 BOM is skipped')
 local keys=0
@@ -290,7 +319,98 @@ local older=Link.DEFAULT:gsub('# Shared enemies.*$','')
 assert(older~=Link.DEFAULT and not older:find('fight') and not older:find('shared'))
 s,notes=Link.parse_settings(older)
 assert(#notes==0 and s.shared_enemies==true and #s.fight_chars==0 and s.menu_key.name=='F5' and s.send_rate==60
-    and s.name_tag==true and s.cloth==false)
+    and s.name_tag==true and s.cloth==false and s.guest_kills=='at_once')
+-- guest_kills: at_once (the default, F4) or confirmed (F4's fallback: the guest's copies hold a 1 HP floor until the
+-- host's game confirms the death), in any case; a new file names it; a bad value keeps at_once, with a line.
+assert(Link.DEFAULT:find('\nguest_kills=at_once\n',1,true),'Written in a new file')
+for _,case in ipairs({{'confirmed','confirmed'},{'Confirmed','confirmed'},{'AT_ONCE','at_once'}}) do
+    s,notes=Link.parse_settings('guest_kills='..case[1])
+    assert(#notes==0 and s.guest_kills==case[2],case[1])
+end
+s,notes=Link.parse_settings('guest_kills=later')
+assert(#notes==1 and notes[1]=="settings: line 1: 'later' is not allowed for guest_kills (use at_once or confirmed); "
+    .."guest_kills stays at_once" and s.guest_kills=='at_once',notes[1])
+-- Two-player scaling, the host's for both games: enemy_hp_scale and enemy_balance_scale from 1.0 to 4.0, whole or with
+-- decimals (1.35 and 1.15 by default); kill_credit all (the default) or fought, in any case. A new file names all
+-- three; a file written before them reads the defaults with no line; a bad value keeps the default, with a line.
+assert(Link.DEFAULT:find('\nenemy_hp_scale=1.35\nenemy_balance_scale=1.15\n',1,true),'Written in a new file')
+assert(Link.DEFAULT:find('\nkill_credit=all\n',1,true))
+s,notes=Link.parse_settings(older)
+assert(#notes==0 and s.enemy_hp_scale==1.35 and s.enemy_balance_scale==1.15 and s.kill_credit=='all')
+for _,case in ipairs({{'1','4','FOUGHT'},{'2.0','1.5','all'},{'1.05','1.00','Fought'},{'1.','3.999','ALL'}}) do
+    s,notes=Link.parse_settings('enemy_hp_scale='..case[1]..'\nenemy_balance_scale='..case[2]..'\nkill_credit='
+        ..case[3])
+    assert(#notes==0 and s.enemy_hp_scale==tonumber(case[1]) and s.enemy_balance_scale==tonumber(case[2])
+        and s.kill_credit==case[3]:lower(),case[1])
+end
+for _,bad in ipairs({'0.99','4.01','1,35','x','-1.2','1e0','0x1','','1.2.3','.5','135'}) do
+    s,notes=Link.parse_settings('enemy_balance_scale='..bad)
+    assert(#notes==1 and notes[1]=="settings: line 1: '"..bad.."' is not allowed for enemy_balance_scale (use 1.0 to "
+        .."4.0); enemy_balance_scale stays 1.15" and s.enemy_balance_scale==1.15,bad..': '..tostring(notes[1]))
+end
+s,notes=Link.parse_settings('kill_credit=mine')
+assert(#notes==1 and notes[1]=="settings: line 1: 'mine' is not allowed for kill_credit (use all or fought); "
+    .."kill_credit stays all" and s.kill_credit=='all',notes[1])
+-- same_place (stage 3a, experimental): on or off in any case, off by default and in a file written before it; a new
+-- file names it after kill_credit, with its comment; a bad value keeps off, with a line.
+assert(Link.DEFAULT:find('\nkill_credit=all\n# Same place, experimental, ',1,true)
+    and Link.DEFAULT:find('\nsame_place=off\n',1,true))
+s,notes=Link.parse_settings(older)
+assert(#notes==0 and s.same_place==false)
+s,notes=Link.parse_settings(Link.DEFAULT)
+assert(#notes==0 and s.same_place==false)
+for _,case in ipairs({{'on',true},{'ON',true},{'Off',false}}) do
+    s,notes=Link.parse_settings('same_place='..case[1])
+    assert(#notes==0 and s.same_place==case[2],case[1])
+end
+s,notes=Link.parse_settings('same_place=yes')
+assert(#notes==1 and notes[1]=="settings: line 1: 'yes' is not allowed for same_place (use on or off); "
+    .."same_place stays off" and s.same_place==false,notes[1])
+-- aggro (stage 3b, the host's): game or host in any case, game by default and in a file written before it; a new
+-- file names it right after same_place; a bad value keeps game, with a line.
+assert(Link.DEFAULT:find('\nsame_place=off\naggro=game\n',1,true))
+s,notes=Link.parse_settings(older)
+assert(#notes==0 and s.aggro=='game')
+for _,case in ipairs({{'host','host'},{'HOST','host'},{'Game','game'}}) do
+    s,notes=Link.parse_settings('aggro='..case[1])
+    assert(#notes==0 and s.aggro==case[2],case[1])
+end
+s,notes=Link.parse_settings('aggro=guest')
+assert(#notes==1 and notes[1]=="settings: line 1: 'guest' is not allowed for aggro (use game or host); aggro stays "
+    .."game" and s.aggro=='game',notes[1])
+-- same_spawns (stage 4, experimental, the host's): on or off in any case, off by default and in a file written before
+-- it; a new file names it right after aggro, with its comment; a bad value keeps off, with a line.
+assert(Link.DEFAULT:find('\naggro=game\n# Same spawns, experimental, ',1,true)
+    and Link.DEFAULT:find('\nsame_spawns=off\n',1,true))
+s,notes=Link.parse_settings(older)
+assert(#notes==0 and s.same_spawns==false)
+s,notes=Link.parse_settings(Link.DEFAULT)
+assert(#notes==0 and s.same_spawns==false)
+for _,case in ipairs({{'on',true},{'ON',true},{'Off',false}}) do
+    s,notes=Link.parse_settings('same_spawns='..case[1])
+    assert(#notes==0 and s.same_spawns==case[2],case[1])
+end
+s,notes=Link.parse_settings('same_spawns=yes')
+assert(#notes==1 and notes[1]=="settings: line 1: 'yes' is not allowed for same_spawns (use on or off); "
+    .."same_spawns stays off" and s.same_spawns==false,notes[1])
+-- enemy_extra (stage 4b, the host's, used with same_spawns only): a whole number from 0 to 3, 0 by default and in a
+-- file written before it; a new file names it right after same_spawns, with its comment; a bad value keeps 0, with a
+-- line.
+assert(Link.DEFAULT:find('\nsame_spawns=off\n# Extra enemies, experimental, ',1,true)
+    and Link.DEFAULT:find('\nenemy_extra=0\n',1,true))
+s,notes=Link.parse_settings(older)
+assert(#notes==0 and s.enemy_extra==0)
+s,notes=Link.parse_settings(Link.DEFAULT)
+assert(#notes==0 and s.enemy_extra==0)
+for n=0,3 do
+    s,notes=Link.parse_settings('enemy_extra='..n)
+    assert(#notes==0 and s.enemy_extra==n and math.type(s.enemy_extra)=='integer',n)
+end
+for _,bad in ipairs({'4','-1','1.5','two','03'}) do
+    s,notes=Link.parse_settings('enemy_extra='..bad)
+    assert(#notes==1 and notes[1]=="settings: line 1: '"..bad.."' is not allowed for enemy_extra (use 0 to 3); "
+        .."enemy_extra stays 0" and s.enemy_extra==0,notes[1])
+end
 
 -- The synced photo mode's: photo_sync both, notice or off (any case, both by default); photo_freeze_max 0 or 30 to
 -- 3600 whole seconds (600); photo_ghost on and photo_name_tag off. A new file names all four with their defaults; one

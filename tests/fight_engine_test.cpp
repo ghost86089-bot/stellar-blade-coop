@@ -1,13 +1,21 @@
-// Shared Naytibas, stage 1, the engine on the build machine against fake memory laid out like the pinned build: the
-// census over the actor map (free slots, inline and heap allocation bits, implausible pointers, players and dying
+// Shared Naytibas, stages 1 and 2, the engine on the build machine against fake memory laid out like the pinned build:
+// the census over the actor map (free slots, inline and heap allocation bits, implausible pointers, players and dying
 // actors left out), the liveness test, implausible reads latching, the two phases (a write that summons an actor and
-// moves the map), pooled reuse, the local EVE as a kill's cause and the floors; the job's guards, its arming and
-// re-arming, the ring and the latch, a job that never runs, a long pause, photo mode; a guest restarting mid-fight;
+// moves the map), pooled reuse, the local EVE as a kill's cause and the floors; the state map and the NoDamage
+// counts; the effect list and the crowd control mirrored through SB's effect call; same-place enemies' logic side
+// (stage 3a): the guest's freeze on each copy it draws, put on again after SB's own dispel and lost after 5 tries, the
+// release flags and takedown markers, the dispel before a kill and on every way out, the pair table to the game thread
+// and BattleMode_5s from its word; stage 3b's hand-overs on both sides (the host's rule, its freeze before own G and
+// its thaw with own H or her own-no, her answers and her give-backs, a take-over her game thread refused, aggro=host,
+// place 0, an undrawable copy) and in
+// two worlds through channel 2 (one AI copy an enemy but one hop of a hand-over, one owner at an epoch, no frozen copy
+// once the link goes); the job's guards, its arming and re-arming, the ring and the latch, a job that never runs, a
+// long pause, photo mode; a guest restarting mid-fight;
 // the hand-over between the job and the worker (Mail) and the worker's side (Worker: on and off, the gates, our photo
 // mode, channel 2's text, the log); the probe (T11a: every live actor, the world fence, test writes) in the engine and
 // through the worker; a recording made by one PC's host replayed into another's guest, and a recording at its cap;
-// then two PCs linked through channel 2's text at 120 +/- 30 ms with 2 % of hp lines lost until every enemy died once
-// in each world: the stage's exit criteria.
+// then two PCs linked through channel 2's text at 120 +/- 30 ms with 2 % of hp lines lost, knocking enemies down, until
+// every enemy died once in each world: the stage's exit criteria.
 #include "fight_engine.h"
 
 #include <algorithm>
@@ -30,7 +38,7 @@ using namespace coop::fight;
 namespace {
 constexpr uint64_t kBase = 0x7ff600000000;
 constexpr uint32_t kChar = 900;       // The allowlisted charId.
-constexpr size_t kMinimumHp = 0x2c4;  // FSBActor, stat 107: ApplyStat's HP floor.
+constexpr int32_t kGetup = 3000310;   // Stands for Getup, which Down chains into (its ID is not in the export).
 const int kVtable = 0;                // Stands for the glue's vtable: never called here.
 uint64_t rebased(uint64_t address) { return kBase + (address - kImageBase); }
 
@@ -71,17 +79,49 @@ struct Memory {
   }
 };
 
+// SB's state map at fsb + 0x560 (PHASE11-STAGE2-RE 1): the (state, count) pairs as elements in order at data, each
+// bucket's chain newest first, HashSize size with its buckets inline (heap 0) or at heap; NumFree 0.
+void put_states(Memory &mem, uint64_t fsb, const std::vector<std::pair<int32_t, int32_t>> &keys, uint64_t data,
+                uint64_t heap, int32_t size) {
+  const uint64_t map = fsb + kStateMap;
+  std::vector<int32_t> bucket(size_t(size), -1);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const int32_t slot = keys[i].first & (size - 1), e[4] = {keys[i].first, keys[i].second, bucket[size_t(slot)], slot};
+    std::memcpy(mem.at(data + 16 * i, 16), e, 16);
+    bucket[size_t(slot)] = int32_t(i);
+  }
+  mem.put(map, data);
+  mem.put<int32_t>(map + 0x08, int32_t(keys.size()));
+  mem.put<int32_t>(map + 0x34, 0);
+  mem.put<uint64_t>(map + 0x40, heap);
+  mem.put<int32_t>(map + 0x48, size);
+  if (heap)
+    std::memcpy(mem.at(heap, 4 * bucket.size()), bucket.data(), 4 * bucket.size());
+  else
+    mem.put<int32_t>(map + 0x38, bucket[0]);
+}
+
 // One PC's game: SB's globals, the net-mode cache, the logic singleton with its actor map (elements and allocation
-// bits, inline up to 128) and job queue, the world's actor manager, logic actors and FSBActors; this PC's EVE is
-// GUID 1. SB's lookup, ApplyStat, SendJob, remove-dead and Logic Reset act as the decompiles show; channel 2 is two
+// bits, inline up to 128) and job queue, the world's actor manager, logic actors with their effect lists and FSBActors
+// with their state maps; this PC's EVE is GUID 1. SB's lookup, ApplyStat, the effect call, SendJob, remove-dead and
+// Logic Reset act as the decompiles show; the crowd-control effects run down and chain each turn; channel 2 is two
 // queues, or the worker's Mail once set (as WinGame's in pose_tick.cpp).
 struct Game {
   Memory mem;
   uint64_t net = 0, logic = 0, world = 0, manager = 0, players = 0, data = 0, heap = 0, eve = 0;
   int32_t capacity = 0;
   struct Body {
-    uint64_t fsb = 0;
-    bool nodamage = false, immortal = false;
+    uint64_t fsb = 0, states_at = 0;          // Its state map's elements and buckets.
+    std::map<int32_t, int32_t> states;        // The state map's counts by state (a key stays at 0 once added).
+    bool immortal = false, immune = false;    // immune: SB's effect call refuses every effect on it.
+    int32_t refuses = 0;                      // An effect row SB's effect call refuses on it.
+    struct Running {
+      uint64_t at;
+      int32_t id;
+      int left; // Turns.
+    };
+    std::vector<Running> effects; // Its effect list (logic actor +0x170), in order.
+    uint64_t list_at = 0;
     int deaths = 0;
     uint64_t killer = 0;  // The cause of its death.
     uint32_t gone_at = 0; // Once dying: the turn remove-dead takes it out of the map.
@@ -91,20 +131,37 @@ struct Game {
   std::map<uint32_t, std::vector<Job *>> queue; // SB's job queue: turn -> jobs.
   bool processing = false;
   uint32_t late = 0; // Game-thread pushes land this many turns back: on a key already drained, never run.
+  uint64_t no_floor = 0; // A logic actor whose stat 107 this build keeps elsewhere: ApplyStat moves elsewhere instead.
+  uint64_t no_scale = 0; // The same for its stat 3.
+  float elsewhere = 0;
+  uint64_t torn = 0; // A logic actor whose reads fault (an exception here, SEH in the glue).
+  uint64_t ops = 0; // Calls of ApplyStat and of the effect function so far: their order.
   struct Call {
     uint64_t la;
     int type;
     float delta;
     uint64_t cause;
     bool notify, ignore;
+    uint64_t op;
   };
   std::vector<Call> calls;      // Every ApplyStat.
+  struct Cast {
+    uint64_t logic, la, caster;
+    int32_t id;
+    uint64_t op;
+  };
+  std::vector<Cast> casts;                                  // Every call of SB's effect function.
+  std::vector<std::pair<uint64_t, Body::Running>> starting; // Effects cast this turn: they start at its actor tick.
   std::function<void()> during; // Runs inside the next ApplyStat: a summon that moves the map.
   std::deque<Message> inbox;
   std::vector<Message> sent;
   std::vector<Event> events;
   std::vector<Actor> probes;
+  const Engine *watch = nullptr; // Once set: lines and events this game takes after that engine latched.
+  size_t after_latch = 0;
   Mail *mail = nullptr;
+  PilotTable table;  // The pair table the job published last, without a Mail.
+  StreamFlags flags; // What the game thread says of the owner's stream, without a Mail.
 
   explicit Game(int32_t slots = 64) {
     const uint64_t globals = rebased(coop::nightop::kGlobals);
@@ -182,11 +239,12 @@ struct Game {
 
   // ---- Actors ----
   // A logic actor and its FSBActor, in the map: a Spawn-state enemy at full HP (MaxShield 100, MaxStamina 200), a
-  // Monster unless said.
+  // Monster unless said. Its MaxHPValue (stat 3) is its MaxHP, MaxHPRate (4) 0.
   uint64_t spawn(uint32_t guid, uint32_t spawn_id, uint8_t index, uint32_t chr = kChar, float max_hp = 1600,
                  uint8_t type = kTypeMonster) {
-    uint64_t la = mem.alloc(0x628), f = mem.alloc(0x2608);
+    uint64_t la = mem.alloc(0x628), f = mem.alloc(kTimeScale + 4);
     mem.put(la, rebased(kActorVtable));
+    mem.put(f + kTimeScale, 1.f);
     mem.put(la + kGuid, guid);
     mem.put(la + kFsb, f);
     mem.put<uint8_t>(la + kAlive, 1);
@@ -200,12 +258,111 @@ struct Game {
       mem.put(f + kStatBase + 4 * size_t(kStatType[s]), max[s]);
       mem.put(f + kStatBase + 4 * size_t(kStatType[s] + 1), max[s]);
     }
+    mem.put(f + kStatBase + 4 * size_t(kMaxHpValue), max_hp);
     bodies[la].fsb = f;
+    bodies[la].states_at = mem.alloc(0x600); // Elements (64 at most), then 8 buckets at +0x400.
+    bodies[la].list_at = mem.alloc(0x400);   // 128 effects at most.
+    mem.put(la + kEffects, bodies[la].list_at);
     by_guid[guid] = la;
     link(guid, la);
     return la;
   }
   Body &body(uint32_t guid) { return bodies[by_guid[guid]]; }
+  // A state's count on an actor, and its state map written again: HashSize 1 with the inline bucket for one key or
+  // none, else 8 buckets on the heap (states 3 and 27 then chain in one).
+  void state(uint32_t guid, int32_t s, int32_t count) { put_state(body(guid), s, count); }
+  void put_state(Body &b, int32_t s, int32_t count) {
+    b.states[s] = count;
+    const std::vector<std::pair<int32_t, int32_t>> keys(b.states.begin(), b.states.end());
+    put_states(mem, b.fsb, keys, b.states_at, keys.size() > 1 ? b.states_at + 0x400 : 0, keys.size() > 1 ? 8 : 1);
+  }
+
+  // ---- Effects (PHASE11-STAGE2-RE 2) ----
+  // The rows as this fake runs them: the turns each lasts, what its end chains into, the state it holds. The crowd
+  // controls (Down 6, Groggy 7, Airborne 8; Getup none); same-place enemies' BlockAI_Infinite (39, for good),
+  // SkillCancel, BlockAI_Dispel (start() ends every BlockAI_Infinite), BattleMode_5s (30) and the takedown markers.
+  struct Row {
+    int32_t id;
+    int turns;
+    int32_t next, state;
+  };
+  static const Row &row(int32_t id) {
+    static const Row rows[] = {{9900001, 6, 9900003, 8}, {9900003, 4, 3000300, 6}, {3000300, 4, kGetup, 6},
+                               {3000301, 4, kGetup, 6},  {3000303, 4, kGetup, 6},  {kGetup, 3, 0, 0},
+                               {3000401, 2, 3000402, 7}, {3000402, 6, 0, 7},
+                               {kBlockAi, 1 << 30, 0, kBlockAiState}, {kSkillCancel, 6, 0, 0}, {kDispel, 6, 0, 0},
+                               {kBattleMode, 300, 0, kBattleState}, {5000039, 60, 0, 0}, {2006004, 60, 0, 0}};
+    for (const Row &r : rows)
+      if (r.id == id)
+        return r;
+    assert(false);
+    return rows[0];
+  }
+  // An effect starts on la: in its list, its state held one more time.
+  void start(uint64_t la, Body::Running e) {
+    Body &b = bodies[la];
+    const Row &r = row(e.id);
+    for (size_t i = 0; e.id == kDispel && i < b.effects.size();)
+      if (b.effects[i].id == kBlockAi) {
+        b.effects.erase(b.effects.begin() + long(i));
+        put_state(b, kBlockAiState, b.states[kBlockAiState] - 1);
+      } else {
+        ++i;
+      }
+    e.left = r.turns;
+    mem.put<int32_t>(e.at + kEffectId, e.id);
+    b.effects.push_back(e);
+    if (r.state)
+      put_state(b, r.state, b.states[r.state] + 1);
+    list(la);
+  }
+  void list(uint64_t la) {
+    Body &b = bodies[la];
+    mem.put<int32_t>(la + kEffectCount, int32_t(b.effects.size()));
+    for (size_t i = 0; i < b.effects.size(); ++i)
+      mem.put(b.list_at + 8 * i, b.effects[i].at);
+  }
+  // A hit of this PC's EVE that knocks guid down or launches it: the effect starts at once.
+  void knock(uint32_t guid, int32_t id) { start(by_guid[guid], {mem.alloc(0x110), id, 0}); }
+  // SB's own BlockAI_Dispel on guid, as at a spawn Show's end: every BlockAI effect ends at once.
+  void dispel(uint32_t guid) { knock(guid, kDispel); }
+  // An effect leaves guid's list before its time (a takedown's marker as the takedown ends).
+  void end(uint32_t guid, int32_t id) {
+    Body &b = body(guid);
+    for (size_t i = 0; i < b.effects.size(); ++i)
+      if (b.effects[i].id == id) {
+        b.effects.erase(b.effects.begin() + long(i));
+        return list(by_guid[guid]);
+      }
+  }
+  bool in_cc(uint64_t la) {
+    const Body &b = bodies[la];
+    return held(b, 6) || held(b, 7) || held(b, 8);
+  }
+  // The actor tick's part: each effect runs down, and at its end its state goes and its chain starts; then the effects
+  // cast during the turn start (their start delay).
+  void run_effects() {
+    for (auto &[la, b] : bodies)
+      for (size_t i = 0; i < b.effects.size();) {
+        if (--b.effects[i].left > 0) {
+          ++i;
+          continue;
+        }
+        const Row &r = row(b.effects[i].id);
+        b.effects.erase(b.effects.begin() + long(i));
+        if (r.state)
+          put_state(b, r.state, b.states[r.state] - 1);
+        list(la);
+        if (r.next)
+          start(la, {mem.alloc(0x110), r.next, 0}); // At the end: run down from the next turn.
+      }
+    for (auto &[la, e] : std::exchange(starting, {}))
+      start(la, e);
+  }
+  static bool held(const Body &b, int32_t s) {
+    auto it = b.states.find(s);
+    return it != b.states.end() && it->second;
+  }
   uint64_t fsb(uint32_t guid) { return body(guid).fsb; }
   uint64_t stat_at(uint32_t guid, int s) { return fsb(guid) + kStatBase + 4 * size_t(kStatType[s]); }
   int32_t hp(uint32_t guid) { return int32_t(mem.get<float>(stat_at(guid, kHp))); }
@@ -220,9 +377,10 @@ struct Game {
 
   // FUN_141ba8720 for HP, Shield and Stamina (RE3): whole units; nothing on HP once dying; NoDamage blocks HP and
   // Shield drops unless ignored; HP stops at max(MinimumHP, 1 when Immortal) and at MaxHP, the others at 0 and their
-  // max; HP reaching 0 starts the death (pending, life state 4) once.
+  // max; HP reaching 0 starts the death (pending, life state 4) once. MaxHPValue (3): MaxHP becomes stat 3 x (1 + stat
+  // 4) and HP is clamped to it; MaxStamina (13): stored, Stamina clamped to it (PHASE11-STAGE2-RE 4).
   void stat(uint64_t la, int type, float delta, uint64_t cause, bool notify, bool ignore) {
-    calls.push_back(Call{la, type, delta, cause, notify, ignore});
+    calls.push_back(Call{la, type, delta, cause, notify, ignore, ++ops});
     if (during) {
       auto f = std::move(during);
       during = nullptr;
@@ -231,9 +389,37 @@ struct Game {
     Body &b = bodies[la];
     const int32_t life = mem.get<int32_t>(b.fsb + kLife);
     const float d = std::trunc(delta);
+    if (type == kFloorStat) { // MinimumHP: stored as it comes, never clamped (PHASE11-STAGE2-RE 3).
+      if (la != no_floor)
+        mem.put(b.fsb + kMinimumHp, mem.get<float>(b.fsb + kMinimumHp) + delta);
+      else
+        elsewhere += delta;
+      return;
+    }
     if (d == 0 || (type == 1 && (mem.get<uint8_t>(la + kPendingDeath) || (life >= 3 && life <= 5))))
       return;
-    if (d < 0 && (type == 1 || type == 7) && b.nodamage && !ignore)
+    const auto max_of = [&](int t) { // A max stored as SetStat stores it: whole units, never below 0.
+      const float max = std::max(0.f, std::trunc(mem.get<float>(b.fsb + kStatBase + 4 * uint64_t(t)) + d));
+      mem.put(b.fsb + kStatBase + 4 * uint64_t(t), max);
+      return max;
+    };
+    if (type == kMaxHpValue) {
+      if (la == no_scale) {
+        elsewhere += delta;
+        return;
+      }
+      const float base = max_of(kMaxHpValue), rate = mem.get<float>(b.fsb + kStatBase + 4 * uint64_t(kMaxHpRate));
+      const float max = std::trunc(base * (1 + rate));
+      mem.put(b.fsb + kStatBase + 8, max);
+      mem.put(b.fsb + kStatBase + 4, std::min(mem.get<float>(b.fsb + kStatBase + 4), max));
+      return;
+    }
+    if (type == kMaxStamina) {
+      const float max = max_of(kMaxStamina);
+      mem.put(b.fsb + kStatBase + 48, std::min(mem.get<float>(b.fsb + kStatBase + 48), max));
+      return;
+    }
+    if (d < 0 && (type == 1 || type == 7) && (held(b, 3) || held(b, 4)) && !ignore)
       return;
     const uint64_t at = b.fsb + kStatBase + 4 * uint64_t(type);
     const float v = mem.get<float>(at), max = mem.get<float>(at + 4);
@@ -275,6 +461,7 @@ struct Game {
         e.simulate(*j, *this, now);
     }
     processing = false;
+    run_effects();
     mem.put(logic + kTurn, turn() + 1);
   }
   // Logic Reset: slot 0 with 1 on every queued job, the queue emptied, turn 0.
@@ -287,7 +474,11 @@ struct Game {
   }
 
   // ---- The Game the engine takes ----
-  bool read(uint64_t address, void *out, size_t n) { return mem.read(address, out, n); }
+  bool read(uint64_t address, void *out, size_t n) {
+    if (torn && address >= torn && address < torn + 0x628)
+      throw torn;
+    return mem.read(address, out, n);
+  }
   // FUN_141ad6ab0: the element by key, then the value's own test (+0x20 set, +0x491, +0x60); no GUID compare.
   uint64_t find(uint64_t lg, uint32_t guid) {
     assert(lg == logic);
@@ -304,6 +495,16 @@ struct Game {
   void apply(uint64_t la, int type, float delta, uint64_t cause, bool notify) {
     stat(la, type, delta, cause, notify, true);
   }
+  // FUN_141ad08b0(logic, target, caster, id, &zero, 0, nullptr): the effect, which starts at this turn's actor tick, or
+  // 0 when the target refuses it. A copy in a crowd control never gets a mirrored one from us.
+  uint64_t effect(uint64_t lg, uint64_t la, uint64_t caster, int32_t id) {
+    casts.push_back({lg, la, caster, id, ++ops});
+    assert(!cc_effect(uint64_t(id)) || !in_cc(la));
+    if (bodies[la].immune || id == bodies[la].refuses)
+      return 0;
+    starting.push_back({la, {mem.alloc(0x110), id, 0}});
+    return starting.back().second.at;
+  }
   void push(Job *job) { queue[processing ? turn() + 1 : turn() - late].push_back(job); }
   bool receive(Message &m) {
     if (mail)
@@ -314,8 +515,12 @@ struct Game {
     inbox.pop_front();
     return true;
   }
-  void send(const Message &m) { mail ? mail->send(m) : sent.push_back(m); }
+  void send(const Message &m) {
+    after_latch += watch && watch->latched();
+    mail ? mail->send(m) : sent.push_back(m);
+  }
   void event(const Event &e) {
+    after_latch += watch && watch->latched();
     events.push_back(e);
     if (mail)
       mail->event(e);
@@ -324,6 +529,116 @@ struct Game {
     probes.push_back(a);
     if (mail)
       mail->probe(a);
+  }
+  bool publish(const PilotTable &t, StreamFlags &f) {
+    if (mail)
+      return mail->publish(t, f);
+    table = t;
+    f = flags;
+    return true;
+  }
+
+  // ---- Same spawns (stage 4): SB's tables, zones, spawn manager and job sender ----
+  // Each made by spawns(): the table holder (its +0x20 the tables), the spawn manager (+0x1c its state, 3 after an
+  // entry) and the job sender in the globals block. A spawn row holds SpawnType, Zone, SaveType and the keep flag where
+  // the build has them, a zone row its ID; FUN_141a9db80 and FUN_141a9b8a0 find them, SB's spawn call makes an actor of
+  // the row's character at once in Spawn state, and SB's despawn job puts one in Despawn (life state 4, its HP kept)
+  // and takes it out of the map three turns later: no death.
+  uint64_t tables = 0, spawn_manager = 0, sender = 0;
+  std::map<uint32_t, uint64_t> spawn_rows; // EventSpawnId -> row.
+  std::map<uint64_t, uint64_t> zone_rows;  // Zone alias -> row.
+  std::map<uint32_t, std::pair<uint32_t, uint8_t>> row_char; // A row's character: charId and ActorType.
+  struct Made {
+    uint32_t id;
+    uint8_t index;
+    float at[3], rot[3];
+    uint32_t guid;
+  };
+  std::vector<Made> made;
+  std::vector<uint32_t> despawned;
+  uint64_t lookups = 0;  // FUN_141a9db80 and FUN_141a9b8a0 calls.
+  uint32_t next_guid = 50000;
+  void spawns() {
+    const uint64_t holder = mem.alloc(0x30);
+    tables = mem.alloc(0x100), spawn_manager = mem.alloc(0x40), sender = mem.alloc(0x40);
+    mem.regions[rebased(kTables)].assign(8, 0);
+    mem.regions[rebased(kSpawnManager)].assign(8, 0);
+    mem.put(rebased(kTables), holder);
+    mem.put(holder + kTablesAt, tables);
+    mem.put(rebased(kSpawnManager), spawn_manager);
+    mem.put(rebased(kJobSender), sender);
+    mem.put(rebased(coop::nightop::kGlobals) + kPauseAt, mem.alloc(0x220)); // The reg: no pause tag.
+    mem.put<uint32_t>(spawn_manager + kSpawnState, 3);
+  }
+  void zone(uint64_t alias, uint32_t id) {
+    zone_rows[alias] = mem.alloc(0x30);
+    mem.put(zone_rows[alias] + kZoneId, id);
+  }
+  void spawn_row(uint32_t id, uint8_t save, uint64_t zone_alias, uint8_t spawn_type = 0, bool keep = false) {
+    const uint64_t r = spawn_rows[id] = mem.alloc(0x100);
+    mem.put(r + kRowSpawnType, spawn_type);
+    mem.put(r + kRowSaveType, save);
+    mem.put<uint8_t>(r + kRowKeep, keep);
+    mem.put(r + kRowZone, zone_alias);
+  }
+  void enter(uint64_t alias) { mem.put(logic + kZoneAlias, alias); }
+  void place(uint32_t guid, float x, float y, float yaw = 0) {
+    const float at[3] = {x, y, 0}, rot[3] = {0, yaw, 0};
+    for (int k = 0; k < 3; ++k)
+      mem.put(fsb(guid) + kLocation + 4 * size_t(k), at[k]), mem.put(fsb(guid) + kFsbRotation + 4 * size_t(k), rot[k]);
+  }
+  uint64_t spawn_row(uint64_t t, uint32_t id) {
+    assert(t == tables);
+    ++lookups;
+    return spawn_rows.count(id) ? spawn_rows[id] : 0;
+  }
+  uint64_t zone_row(uint64_t t, uint64_t alias) {
+    assert(t == tables);
+    ++lookups;
+    return zone_rows.count(alias) ? zone_rows[alias] : 0;
+  }
+  void create(uint64_t manager, uint32_t id, uint8_t index, const float *at, const float *rot) {
+    assert(manager == spawn_manager && processing && spawn_rows.count(id));
+    const auto c = row_char.count(id) ? row_char[id] : std::make_pair(kChar, kTypeMonster);
+    spawn(next_guid, id, index, c.first, 1600, c.second);
+    place(next_guid, at[0], at[1], rot[1]);
+    made.push_back(Made{id, index, {at[0], at[1], at[2]}, {rot[0], rot[1], rot[2]}, next_guid++});
+  }
+  void despawn(uint64_t s, uint32_t turn_now, uint32_t guid) {
+    assert(s == sender && turn_now == turn() && processing);
+    despawned.push_back(guid);
+    mem.put<int32_t>(fsb(guid) + kLife, 4);
+    body(guid).gone_at = turn() + 3;
+  }
+  // Extras (stage 4b): NewActor (FUN_141ad1290) of charId chr with an extra's key, from inside the job, makes an actor
+  // in the map at once in Spawn state, a Monster; 0 with refuse_make set.
+  std::vector<Made> extras;
+  bool refuse_make = false, unread_make = false; // unread_make: an actor whose GUID cannot be read.
+  uint64_t make(uint64_t lg, uint32_t chr, const float *at, const float *rot, uint32_t id, uint8_t index) {
+    assert(lg == logic && processing && is_extra(id) && index >= 1 && index <= kMaxPer && (id & 0xff) == index);
+    if (refuse_make)
+      return 0;
+    if (unread_make)
+      return 0x7fff00000000; // Plausible, never mapped.
+    const uint64_t la = spawn(next_guid, id, index, chr);
+    place(next_guid, at[0], at[1], rot[1]);
+    extras.push_back(Made{id, index, {at[0], at[1], at[2]}, {rot[0], rot[1], rot[2]}, next_guid++});
+    return la;
+  }
+  // The keys of this world's Monsters in the map, alive or dying, sorted.
+  std::vector<std::pair<uint32_t, uint8_t>> keys() {
+    std::vector<std::pair<uint32_t, uint8_t>> out;
+    for (int32_t i = 0; i < used(); ++i) {
+      if (!allocated(i))
+        continue;
+      const uint64_t la = value(i);
+      const int32_t life = mem.get<int32_t>(mem.get<uint64_t>(la + kFsb) + kLife);
+      const uint8_t type = mem.get<uint8_t>(mem.get<uint64_t>(la + kFsb) + kActorType);
+      if (mem.get<uint32_t>(la + kSpawnId) && type == kTypeMonster && life != 4 && life != 5)
+        out.emplace_back(mem.get<uint32_t>(la + kSpawnId), mem.get<uint8_t>(la + kSpawnIndex));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
   }
 };
 
@@ -465,6 +780,12 @@ int main() {
     const uint32_t followed[] = {108, 101, 999, 115, 116, 119};
     n = e->pass(g, g.logic, false, followed, 6);
     assert((guids(*e, n) == std::vector<uint32_t>{108, 101}) && e->seen()[0].dying && e->counts.censuses == 1);
+    // Leaving the map in place (Despawn 4, Destroy 5) with HP left is gone, never a death; with none left, a death.
+    const uint32_t leaving[] = {109, 110};
+    assert(e->pass(g, g.logic, false, leaving, 2) == 0 && !e->latched());
+    g.mem.put<float>(g.stat_at(110, kHp), 0);
+    n = e->pass(g, g.logic, false, leaving, 2);
+    assert((guids(*e, n) == std::vector<uint32_t>{110}) && dying(e->seen()[0]) && !e->seen()[0].dying);
     // A census after them, without them again.
     const uint32_t one[] = {112};
     n = e->pass(g, g.logic, true, one, 1);
@@ -510,6 +831,2334 @@ int main() {
     default: g.mem.put<uint64_t>(g.logic + kMapData, 0x7f0000000000); // Plausible, unmapped.
     }
     assert(e->pass(g, g.logic, true, nullptr, 0) == 0 && e->latched() && std::string(e->why()) == why);
+  }
+
+  // ---- The state map at FSBActor +0x560, read without SB's call (PHASE11-STAGE2-RE 1) ----
+  {
+    Memory mem;
+    const uint64_t fsb = mem.alloc(0x600), data = mem.alloc(0x800), heap = mem.alloc(0x200);
+    const auto read = [&](uint64_t at, void *out, size_t n) { return mem.read(at, out, n); };
+    uint64_t held = 99;
+    // A fresh actor's empty map (ArrayNum == NumFree): nothing held, and nothing else read.
+    assert(held_states(read, fsb, held) && held == 0);
+    // One key: HashSize 1 and the inline bucket. A key at 0 is not held; any other count is.
+    put_states(mem, fsb, {{4, 2}}, data, 0, 1);
+    assert(held_states(read, fsb, held) && held == 1u << 4);
+    put_states(mem, fsb, {{kBlockAiState, 1}}, data, 0, 1); // 39, BlockAI: past a 32-bit word.
+    assert(held_states(read, fsb, held) && held == uint64_t(1) << 39);
+    put_states(mem, fsb, {{4, 0}}, data, 0, 1);
+    assert(held_states(read, fsb, held) && held == 0);
+    // After ClearAllStates: keys 1 to 105 at 0, then NoDamageNoHit, Airborne, BattleMode, DelayDeath and BlockAI held,
+    // 128 buckets on the heap.
+    std::vector<std::pair<int32_t, int32_t>> all;
+    for (int32_t s = 1; s <= 105; ++s)
+      all.push_back({s, s == 3 || s == 8 || s == 30 || s == 32 || s == 39 ? 1 : 0});
+    put_states(mem, fsb, all, data, heap, 128);
+    assert(held_states(read, fsb, held) &&
+           held == (1u << 3 | 1u << 8 | 1u << 30 | uint64_t(1) << 32 | uint64_t(1) << 39));
+    // 8 buckets: 3, 11, 19 and 27 share one, and the walk follows its chain to each; Down held.
+    put_states(mem, fsb, {{3, 0}, {11, 1}, {27, 1}, {19, 2}, {6, 1}}, data, heap, 8);
+    assert(held_states(read, fsb, held) && held == (1u << 27 | 1u << 6));
+    // A torn map is refused, never walked for long or out of its array: a chain looping on itself, a link past
+    // ArrayNum, a HashSize that is no power of two, several buckets with none on the heap, an implausible array.
+    put_states(mem, fsb, {{3, 0}, {11, 0}}, data, heap, 8);
+    mem.put<int32_t>(data + 8, 1); // 3 links back to 11: the walk for 27 would never end.
+    assert(!held_states(read, fsb, held) && held == 0);
+    put_states(mem, fsb, {{3, 1}}, data, heap, 8);
+    mem.put<int32_t>(heap + 4 * 3, 2);
+    assert(!held_states(read, fsb, held));
+    put_states(mem, fsb, {{3, 1}}, data, heap, 3);
+    assert(!held_states(read, fsb, held));
+    put_states(mem, fsb, {{3, 1}, {4, 1}}, data, 0, 8);
+    assert(!held_states(read, fsb, held));
+    put_states(mem, fsb, {{3, 1}}, data, heap, 8);
+    mem.put<uint64_t>(fsb + kStateMap, 0x1235);
+    assert(!held_states(read, fsb, held));
+  }
+
+  // ---- NoDamage windows: the host counts each claim it applies during one, from its copy's state map ----
+  {
+    Game g;
+    auto e = engine(true, true);
+    for (uint32_t i = 0; i < 3; ++i)
+      g.spawn(101 + i, 5001 + i, 0);
+    g.state(101, 3, 1); // NoDamageNoHit: a grab.
+    g.state(102, 4, 2); // NoDamage, held twice.
+    g.state(103, 4, 0); // NoDamage gone: its key stays at 0.
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 0);
+    for (const char *hit : {"SBF11 hit 1 1 101 100 0 0 1600 0", "SBF11 hit 1 2 102 100 0 0 1600 0",
+                            "SBF11 hit 1 3 103 100 0 0 1600 0"})
+      g.inbox.push_back(msg(hit));
+    frame(g, *e, 16);
+    // Every claim passes NoDamage; the two in a window are counted, each under its state.
+    assert(g.hp(101) == 1500 && g.hp(102) == 1500 && g.hp(103) == 1500);
+    assert(e->host.counts.bypass3 == 1 && e->host.counts.bypass4 == 1 && e->host.counts.claims == 3);
+    // A torn map reads as no window, counted, and the shared fight goes on.
+    g.mem.put<int32_t>(g.fsb(101) + kStateMap + 0x48, 3);
+    g.inbox.push_back(msg("SBF11 hit 1 4 101 100 0 0 1500 0"));
+    frame(g, *e, 32);
+    assert(g.hp(101) == 1400 && e->host.counts.bypass3 == 1 && e->counts.unread >= 1 && !e->latched());
+  }
+
+  // ---- Crowd control: told when it starts on our copy, started on it by SB's effect call when hers ----
+  {
+    Game g;
+    auto e = engine(true, true);
+    g.spawn(101, 5001, 0);
+    g.spawn(102, 5002, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 0);
+    lines(g);
+    // Our EVE knocks 101 down: told at the next turn, by its GUID; Getup after it is not.
+    g.knock(101, 3000300);
+    uint64_t t = 16;
+    frame(g, *e, t);
+    assert(lines(g) == "SBF11 cc 1 101 3000300\n");
+    for (t += 16; t < 200; t += 16)
+      frame(g, *e, t);
+    assert(!has(lines(g), " cc ") && g.body(101).effects.empty() && !g.in_cc(g.by_guid[101]));
+    // Hers on 102: SB's effect call on the logic singleton, with our EVE's logic actor as the caster. It starts at the
+    // turn's end, then chains (AirborneDown, Down, Getup); none of it is told back.
+    g.inbox.push_back(msg("SBF11 cc 1 102 9900001"));
+    frame(g, *e, t);
+    const Game::Cast &c = g.casts.at(0);
+    assert(c.logic == g.logic && c.la == g.by_guid[102] && c.caster == g.eve && c.id == 9900001);
+    assert(e->host.counts.cc_mirrored == 1);
+    bool airborne = false, down = false;
+    for (const uint64_t end = t + 400; (t += 16) < end;) {
+      frame(g, *e, t);
+      airborne = airborne || Game::held(g.body(102), 8);
+      down = down || (Game::held(g.body(102), 6) && !Game::held(g.body(102), 8));
+    }
+    assert(airborne && down && !g.in_cc(g.by_guid[102]) && !has(lines(g), " cc ") && e->host.counts.cc_told == 1);
+    // While 101 is in the air (our EVE's launch, told), hers for it is skipped; so is one the game refuses (an
+    // immunity), and one with no EVE of ours to cast it.
+    g.knock(101, 9900001);
+    g.inbox.push_back(msg("SBF11 cc 1 101 3000300"));
+    frame(g, *e, t += 16);
+    assert(lines(g) == "SBF11 cc 1 101 9900001\n" && g.casts.size() == 1 && e->host.counts.cc_skipped == 1);
+    g.body(102).immune = true;
+    g.inbox.push_back(msg("SBF11 cc 1 102 3000401"));
+    frame(g, *e, t += 16);
+    assert(g.casts.size() == 2 && e->host.counts.cc_skipped == 2 && e->host.counts.cc_mirrored == 1);
+    g.body(102).immune = false;
+    g.mem.put(g.players, g.mem.alloc(0x2608));
+    g.inbox.push_back(msg("SBF11 cc 1 102 3000401"));
+    frame(g, *e, t += 16);
+    assert(g.casts.size() == 2 && e->host.counts.cc_skipped == 3);
+    g.mem.put(g.players, g.fsb(1));
+    // A torn effect list (an implausible count, or pointer) reads as none, counted, and the shared fight goes on.
+    const size_t unread = e->counts.unread;
+    g.mem.put<int32_t>(g.by_guid[102] + kEffectCount, 100000);
+    frame(g, *e, t += 16);
+    g.mem.put<int32_t>(g.by_guid[102] + kEffectCount, 1);
+    g.mem.put<uint64_t>(g.body(102).list_at, 0x1235);
+    frame(g, *e, t += 16);
+    assert(e->counts.unread == unread + 2 && !e->latched());
+  }
+
+  // ---- guest_kills=confirmed: the 1 HP floor, ApplyStat(107, +1) on every paired copy, comes off on every way out:
+  // before a kill (in the same turn), at unpairing, at off ----
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->confirm(true);
+    e->set(true, false);
+    for (uint32_t i = 0; i < 4; ++i)
+      g.spawn(501 + i, 5001 + i, 0);
+    g.mem.put<float>(g.fsb(504) + kMinimumHp, 1600); // SB's own floor at its HP: ours would raise the HP, so none.
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600", "SBF11 up 1 102 5002 0 900 1600",
+                             "SBF11 up 1 103 5003 0 900 1600", "SBF11 up 1 104 5004 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    const auto floor_of = [&](uint32_t guid) { return g.mem.get<float>(g.fsb(guid) + kMinimumHp); };
+    frame(g, *e, 0);
+    size_t raised = 0;
+    for (const Game::Call &c : g.calls)
+      raised += c.type == kFloorStat && c.delta == 1 && !c.cause && !c.notify;
+    assert(raised == 3 && floor_of(501) == 1 && floor_of(503) == 1 && floor_of(504) == 1600);
+    assert(e->snapshot().floors == 3 && e->guest.linked() == 4);
+    frame(g, *e, 16); // Held: never written twice.
+    assert(g.calls.size() == 3);
+    // Our EVE's lethal hit stops at 1 HP: a lethal claim, and the copy lives.
+    g.hit(501, kHp, 1600);
+    frame(g, *e, 32);
+    assert(g.hp(501) == 1 && g.body(501).deaths == 0 && has(lines(g), "SBF11 hit 1 1 101 1599 0 0 1600 1\n"));
+    // The host's dead: our floor comes off, then the kill with our EVE as the cause, in the same turn.
+    g.calls.clear();
+    g.inbox.push_back(msg("SBF11 dead 1 101"));
+    frame(g, *e, 48);
+    assert(g.calls.size() == 2 && g.calls[0].la == g.by_guid[501] && g.calls[0].type == kFloorStat &&
+           g.calls[0].delta == -1);
+    assert(g.calls[1].type == 1 && g.calls[1].delta == -1 && g.calls[1].cause == g.eve);
+    assert(g.body(501).deaths == 1 && g.body(501).killer == g.eve && floor_of(501) == 0 && e->snapshot().floors == 2);
+    // Unpaired (down): off at once. SB's own floor added since stays: ours comes off alone.
+    g.mem.put<float>(g.fsb(503) + kMinimumHp, 101);
+    g.inbox.push_back(msg("SBF11 down 1 102"));
+    frame(g, *e, 64);
+    assert(floor_of(502) == 0 && e->snapshot().floors == 1);
+    // Off (coop fight off, a lost host, a pause, coop off): the job's last run takes the rest off and pushes no more.
+    e->set(false, false);
+    frame(g, *e, 80);
+    assert(floor_of(503) == 100 && e->snapshot().floors == 0 && g.queue.empty() && !e->latched());
+  }
+  // A new session takes the old one's floors off before it starts; a latch (an implausible read) in the same turn;
+  // lift(), the glue's call after a fault in our code, from outside Simulate. A floor whose enemy left the map needs no
+  // call (spawn init resets stat 107); one the game would not raise turns the feature off.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->confirm(true);
+    const auto floor_of = [&](uint32_t guid) { return g.mem.get<float>(g.fsb(guid) + kMinimumHp); };
+    uint64_t t = 0;
+    const auto pair = [&] { // Pairs come at a census.
+      for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600", "SBF11 up 1 102 5002 0 900 1600"})
+        g.inbox.push_back(msg(line));
+      for (const uint64_t end = t + 16 * kCensusTurns; t <= end && e->snapshot().floors < 2; t += 16)
+        frame(g, *e, t);
+      assert(e->snapshot().floors == 2 && floor_of(501) == 1 && floor_of(502) == 1);
+    };
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    g.spawn(502, 5002, 0);
+    pair();
+    e->set(true, false); // A new session.
+    frame(g, *e, t += 16);
+    assert(e->snapshot().floors == 0 && floor_of(501) == 0 && floor_of(502) == 0);
+    pair();
+    g.mem.put<float>(g.stat_at(502, kHp), std::nanf(""));
+    frame(g, *e, t += 16);
+    assert(e->latched() && e->snapshot().floors == 0 && floor_of(501) == 0 && floor_of(502) == 0);
+
+    Game f;
+    auto e2 = engine(false, false);
+    e2->confirm(true);
+    e2->set(true, false);
+    f.spawn(501, 5001, 0);
+    f.spawn(502, 5002, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600", "SBF11 up 1 102 5002 0 900 1600"})
+      f.inbox.push_back(msg(line));
+    frame(f, *e2, 0);
+    assert(e2->snapshot().floors == 2);
+    f.unlink(502);
+    const size_t calls = f.calls.size();
+    e2->latch("fault");
+    e2->lift(f);
+    assert(e2->snapshot().floors == 0 && f.mem.get<float>(f.fsb(501) + kMinimumHp) == 0 && f.calls.size() == calls + 1);
+    assert(e2->forget() == 0);
+    // A fault in our read of one torn actor while the floors come off: the glue's lift() after it takes the others
+    // off, and forget() still counts that one for the log.
+    Game w;
+    auto e4 = engine(false, false);
+    e4->confirm(true);
+    e4->set(true, false);
+    for (uint32_t guid : {501u, 502u, 503u})
+      w.spawn(guid, 5000 + guid, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5501 0 900 1600", "SBF11 up 1 102 5502 0 900 1600",
+                             "SBF11 up 1 103 5503 0 900 1600"})
+      w.inbox.push_back(msg(line));
+    frame(w, *e4, 0);
+    assert(e4->snapshot().floors == 3);
+    w.torn = w.by_guid[502];
+    e4->latch("fault");
+    for (int pass = 0; pass < 2; ++pass) { // The fault in Simulate's lift_all, then the glue's lift after it.
+      try {
+        e4->lift(w);
+      } catch (uint64_t) {
+      }
+    }
+    assert(w.mem.get<float>(w.fsb(501) + kMinimumHp) == 0 && w.mem.get<float>(w.fsb(503) + kMinimumHp) == 0);
+    assert(w.mem.get<float>(w.fsb(502) + kMinimumHp) == 1 && e4->forget() == 1 && e4->forget() == 0);
+    // The game would not raise it: off for the run, nothing held.
+    Game h;
+    auto e3 = engine(false, false);
+    e3->confirm(true);
+    e3->set(true, false);
+    h.spawn(501, 5001, 0);
+    h.no_floor = h.by_guid[501];
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600"})
+      h.inbox.push_back(msg(line));
+    frame(h, *e3, 0);
+    assert(e3->latched() && !strcmp(e3->why(), "implausible floor") && e3->snapshot().floors == 0);
+    // Its +1 went somewhere: the latch's lift took it back off there.
+    size_t moved = 0;
+    for (const Game::Call &c : h.calls)
+      moved += c.type == kFloorStat;
+    assert(moved == 2 && h.elsewhere == 0 && e3->forget() == 0);
+  }
+
+  // ---- Same-place enemies (stage 3a), the logic side: the guest freezes each copy it draws with SB's effect call,
+  // the copy its own caster, BlockAI_Infinite then SkillCancel; state 39 read at each census, a freeze SB took off
+  // (BlockAI_Dispel at a spawn Show's end) applied again at most 5 times in 10 s, then freeze-lost: dispelled and
+  // local while the pair lasts. The pair table says it all to the game thread ----
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    const uint64_t la = g.by_guid[501];
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    const auto cast_is = [&](size_t i, int32_t id) {
+      return i < g.casts.size() && g.casts[i].logic == g.logic && g.casts[i].la == la && g.casts[i].caster == la &&
+             g.casts[i].id == id;
+    };
+    assert(g.casts.size() == 2 && cast_is(0, kBlockAi) && cast_is(1, kSkillCancel) && count(g, "frozen") == 1);
+    // The host's GUID and ours, the host its owner (3a) at epoch 0, drawn here; state 39 starts at the turn's end.
+    const PilotPair &p = g.table.pairs[0];
+    assert(g.table.on && g.table.count == 1 && g.table.session == e->session() && p.hguid == 101 && p.local == 501 &&
+           p.owner == coop::pilot::kHost && p.oe == 0 && p.bits == kRowDrawn);
+    // The guest's side, in the host's generation (its world line's): a copy she draws is never hers to capture.
+    coop::pilot::Owned owned_rows[kMaxPairs];
+    assert(g.table.side == coop::pilot::kGuest && g.table.gen == 1 && owned(g.table, owned_rows) == 0);
+    frame(g, *e, t += 16);
+    assert(Game::held(g.body(501), kBlockAiState) && p.bits == (kRowDrawn | kRowFrozen) && g.table.ms == t);
+    assert(g.casts.size() == 2 && e->counts.frozen == 1);
+    const auto census = [&] {
+      for (uint32_t i = 0; i < kCensusTurns; ++i)
+        frame(g, *e, t += 16);
+    };
+    g.dispel(501);
+    frame(g, *e, t += 16);
+    assert(!Game::held(g.body(501), kBlockAiState) && p.bits == kRowDrawn && g.casts.size() == 2);
+    census();
+    assert(g.casts.size() == 4 && cast_is(2, kBlockAi) && cast_is(3, kSkillCancel) && e->counts.refrozen == 1);
+    assert(count(g, "frozen again", "state 39 gone") == 1 && Game::held(g.body(501), kBlockAiState));
+    // Taken off at every census: 5 tries within 10 s, then freeze-lost. The pair goes on, its copy local for good.
+    for (int k = 0; k < 4; ++k) {
+      g.dispel(501);
+      census();
+    }
+    assert(e->counts.refrozen == 5 && e->counts.freeze_lost == 0 && g.casts.size() == 12);
+    g.dispel(501);
+    census();
+    assert(e->counts.freeze_lost == 1 && count(g, "freeze-lost") == 1 && g.casts.size() == 13 && cast_is(12, kDispel));
+    assert(p.bits == 0 && g.table.count == 1 && e->guest.linked() == 1 && e->counts.thawed == 1);
+    census();
+    census();
+    assert(g.casts.size() == 13 && e->counts.refrozen == 5);
+    // Tries more than 10 s apart never add up.
+    Game h;
+    auto e2 = engine(false, false);
+    e2->same_place(true);
+    e2->set(true, false);
+    h.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      h.inbox.push_back(msg(line));
+    frame(h, *e2, t += 16);
+    frame(h, *e2, t += 16);
+    for (int k = 0; k < 8; ++k) { // One census in each.
+      h.dispel(501);
+      for (uint32_t i = 0; i <= kCensusTurns; ++i)
+        frame(h, *e2, t += 16);
+      t += kRefreezeMs;
+    }
+    frame(h, *e2, t += 16);
+    assert(e2->counts.refrozen == 8 && e2->counts.freeze_lost == 0 && h.table.pairs[0].bits == kRowDrawn + kRowFrozen);
+    // A copy that never holds state 39 (the game refuses the row) is lost the same way: 6 casts of BlockAI, no
+    // SkillCancel after a refused one.
+    Game r;
+    auto e3 = engine(false, false);
+    e3->same_place(true);
+    e3->set(true, false);
+    r.spawn(501, 5001, 0);
+    r.body(501).immune = true;
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      r.inbox.push_back(msg(line));
+    for (int k = 0; k < 8; ++k)
+      for (uint32_t i = 0; i < kCensusTurns; ++i)
+        frame(r, *e3, t += 16);
+    size_t blocks = 0, cancels = 0;
+    for (const Game::Cast &c : r.casts)
+      blocks += c.id == kBlockAi, cancels += c.id == kSkillCancel;
+    assert(blocks == 6 && cancels == 0 && e3->counts.freeze_lost == 1 && r.table.pairs[0].bits == 0);
+  }
+  // Not frozen while it holds NoDamageNoHit, a crowd control or a takedown marker (Check_LinkSkillHit_Skill 5000039,
+  // LinkState_MonsterHit 2006004) or is not in life state 1; frozen once they end. The release flags (Down, Groggy,
+  // Airborne, a marker), the marker alone (kRowExec), BattleMode (30) and DelayDeath (32) go into the table as read; a
+  // dying copy is dying there.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    for (uint32_t i = 0; i < 5; ++i)
+      g.spawn(501 + i, 5001 + i, 0);
+    g.knock(501, 3000300);
+    g.knock(502, 5000039);
+    g.state(503, kNoDamageNoHit, 1);
+    g.mem.put<int32_t>(g.fsb(504) + kLife, 6); // Spawning.
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600",
+                             "SBF11 up 1 102 5002 0 900 1600", "SBF11 up 1 103 5003 0 900 1600", "SBF11 up 1 104 5004 0 900 1600",
+                             "SBF11 up 1 105 5005 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    const auto bits = [&](uint32_t local) {
+      for (uint8_t i = 0; i < g.table.count; ++i)
+        if (g.table.pairs[i].local == local)
+          return int(g.table.pairs[i].bits);
+      return -1;
+    };
+    const auto frozen = [&](uint32_t guid) {
+      size_t n = 0;
+      for (const Game::Cast &c : g.casts)
+        n += c.la == g.by_guid[guid] && c.id == kBlockAi;
+      return n;
+    };
+    assert(g.table.count == 5 && bits(501) == kRowDrawn + kRowRelease &&
+           bits(502) == kRowDrawn + kRowRelease + kRowExec);
+    assert(bits(503) == kRowDrawn && bits(504) == kRowDrawn && bits(505) == kRowDrawn);
+    assert(g.casts.size() == 2 && frozen(505) == 1);
+    g.end(502, 5000039);
+    g.state(503, kNoDamageNoHit, 0);
+    g.mem.put<int32_t>(g.fsb(504) + kLife, 1);
+    frame(g, *e, t += 16);
+    assert(frozen(502) == 1 && frozen(503) == 1 && frozen(504) == 1 && frozen(501) == 0);
+    for (int i = 0; i < 8; ++i) // Down for 4 turns, then Getup.
+      frame(g, *e, t += 16);
+    assert(frozen(501) == 1 && bits(501) == kRowDrawn + kRowFrozen && e->counts.frozen == 5);
+    // Frozen, then released by a marker or a crowd control: still frozen (never dispelled for it), never frozen again
+    // meanwhile. BattleMode and DelayDeath as read.
+    const size_t casts = g.casts.size();
+    g.knock(501, 2006004);
+    g.knock(502, 3000401);
+    g.state(503, kBattleState, 1);
+    g.state(504, kDelayDeath, 1);
+    frame(g, *e, t += 16);
+    assert(bits(501) == kRowDrawn + kRowFrozen + kRowRelease + kRowExec &&
+           bits(502) == kRowDrawn + kRowFrozen + kRowRelease);
+    assert(bits(503) == kRowDrawn + kRowFrozen + kRowBattle && bits(504) == kRowDrawn + kRowFrozen + kRowDying);
+    g.dispel(501); // Its marker lasts past the next census: no freeze again while it holds.
+    for (uint32_t i = 0; i < kCensusTurns; ++i)
+      frame(g, *e, t += 16);
+    assert(g.casts.size() == casts && bits(501) == kRowDrawn + kRowRelease + kRowExec);
+    // Our EVE's lethal hit: the copy dies by itself (no floor), so it leaves the table with no call on it.
+    g.hit(505, kHp, 1600);
+    frame(g, *e, t += 16);
+    assert(bits(505) == -1 && g.casts.size() == casts && g.body(505).deaths == 1);
+  }
+  // The host owns every pair in 3a: its table names them for its capture (BattleMode and dying as read) while she is
+  // on and same_place is, and it never freezes anything.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    g.spawn(102, 5002, 0);
+    g.state(101, kBattleState, 1);
+    frame(g, *e, 0);
+    assert(!g.table.on && g.table.count == 2);
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 16);
+    const PilotPair &p = g.table.pairs[0];
+    assert(g.table.on && p.hguid == 101 && p.local == 101 && p.owner == coop::pilot::kHost && p.bits == kRowBattle);
+    assert(g.table.side == coop::pilot::kHost && g.table.gen == e->host.gen() && g.table.gen != 0);
+    g.state(102, kDelayDeath, 1);
+    frame(g, *e, 32);
+    assert(g.table.pairs[1].bits == kRowDying && g.casts.empty());
+    // The game thread captures both, with their SBE flags; a row the side draws, or another side's, never.
+    coop::pilot::Owned o[kMaxPairs];
+    assert(owned(g.table, o) == 2 && o[0].hguid == 101 && o[0].local == 101 && o[0].oe == 0 &&
+           o[0].flags == coop::pilot::kBattle && o[1].hguid == 102 && o[1].flags == coop::pilot::kDying);
+    PilotTable mixed = g.table;
+    mixed.pairs[0].bits |= kRowDrawn | kRowFrozen | kRowRelease;
+    mixed.pairs[1].owner = coop::pilot::kGuest;
+    mixed.pairs[1].oe = 4;
+    assert(owned(mixed, o) == 0);
+    mixed.side = coop::pilot::kGuest; // 3b's: hers, at her epoch.
+    assert(owned(mixed, o) == 1 && o[0].hguid == 102 && o[0].oe == 4 && o[0].flags == coop::pilot::kDying);
+    // The game thread's reading: fresh for kTableMs after its publication while the engine is not latched. The lines
+    // told so far are forgotten on a new session or generation or when the table's on turns, never because the table
+    // went stale (a menu stops the job): she still holds them, so a resumed Show told again would play twice.
+    PilotTable seen = g.table;
+    Told told;
+    assert(told.forget(seen) && !told.forget(seen));
+    assert(fresh(seen, seen.ms, false) && fresh(seen, seen.ms + kTableMs - 1, false));
+    assert(!fresh(seen, seen.ms + kTableMs, false) && !fresh(seen, seen.ms, true) && !fresh(PilotTable(), 0, false));
+    assert(!told.forget(seen)); // Stale for seconds, then fresh again: the same session, gen and on.
+    seen.ms += 5000;
+    assert(fresh(seen, seen.ms, false) && !told.forget(seen));
+    seen.on = false;
+    assert(told.forget(seen) && !told.forget(seen));
+    seen.on = true;
+    assert(told.forget(seen));
+    ++seen.session;
+    assert(told.forget(seen));
+    ++seen.gen;
+    assert(told.forget(seen) && !told.forget(seen));
+    e->same_place(false);
+    frame(g, *e, 48);
+    assert(!g.table.on && g.casts.empty());
+  }
+  // The host's dead: our freeze off (BlockAI_Dispel), then the kill, in the same turn, so SB's death runs on a copy
+  // that is not frozen.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, 0);
+    frame(g, *e, 16);
+    assert(Game::held(g.body(501), kBlockAiState));
+    g.inbox.push_back(msg("SBF11 dead 1 101"));
+    frame(g, *e, 32);
+    const Game::Cast &d = g.casts.back();
+    const Game::Call &k = g.calls.back();
+    assert(d.id == kDispel && d.la == g.by_guid[501] && d.caster == d.la && k.type == 1 && k.delta == -1600);
+    assert(k.cause == g.eve && d.op < k.op && g.body(501).deaths == 1 && g.table.count == 0 && e->counts.thawed == 1);
+  }
+  // Through Mail: the job publishes its table after each turn, the game thread takes the newest each frame (try_lock
+  // both ways) and gives back what the owner's stream says: while it says BattleMode for a drawn copy, the job starts
+  // BattleMode_5s (2002701) on it every 2 s, the copy its own caster.
+  {
+    Game g;
+    Mail mail;
+    g.mail = &mail;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    PilotTable table;
+    StreamFlags stream;
+    assert(mail.table(table, stream) && !table.on && table.count == 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      assert(mail.give(msg(line)));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    assert(mail.table(table, stream) && table.on && table.count == 1 && table.ms == 16 && table.turn == 1);
+    assert(table.pairs[0].hguid == 101 && table.pairs[0].local == 501 && table.pairs[0].bits == kRowDrawn + kRowFrozen);
+    const auto battles = [&] {
+      size_t n = 0;
+      for (const Game::Cast &c : g.casts)
+        n += c.id == kBattleMode && c.la == g.by_guid[501] && c.caster == c.la;
+      return n;
+    };
+    stream.battle[0] = 101;
+    stream.count = 1;
+    assert(mail.table(table, stream));
+    frame(g, *e, t += 16); // The job takes it at this turn's end, and starts BattleMode_5s at the next.
+    assert(battles() == 0);
+    frame(g, *e, t += 16);
+    assert(battles() == 1 && e->counts.battles == 1);
+    const uint64_t first = t;
+    while ((t += 16) < first + kBattleMs)
+      frame(g, *e, t);
+    assert(battles() == 1);
+    frame(g, *e, t);
+    assert(battles() == 2);
+    stream.count = 0;
+    assert(mail.table(table, stream));
+    for (const uint64_t end = t + 3 * kBattleMs; (t += 16) < end;)
+      frame(g, *e, t);
+    assert(battles() == 2);
+    // A stream of a pair this side does not draw (the host's same_place off) starts nothing either.
+    assert(mail.give(msg("SBF11 place 1 0")));
+    stream.count = 1;
+    assert(mail.table(table, stream));
+    for (const uint64_t end = t + 3 * kBattleMs; (t += 16) < end;)
+      frame(g, *e, t);
+    assert(battles() == 2 && mail.table(table, stream) && !table.on);
+  }
+  // The rows the game thread drives (drawn(): the pairs this side draws while the table is on, with what the job read
+  // on each copy). A copy the game thread refused to drive (its movement component is not the game's: pilot.h's
+  // Driver) comes back in its word: the job lets it go as if its freeze were lost (BlockAI_Dispel, local while the pair
+  // lasts), whatever the word says after.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    g.spawn(502, 5002, 0);
+    for (const char *line :
+         {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600", "SBF11 up 1 102 5002 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    g.state(501, kDelayDeath, 1);
+    g.knock(502, 2006004);
+    frame(g, *e, t += 16);
+    coop::pilot::Row rows[kMaxPairs];
+    assert(drawn(g.table, rows) == 2 && rows[0].hguid == 101 && rows[0].local == 501 &&
+           rows[0].owner == coop::pilot::kHost && rows[0].oe == 0 && rows[0].frozen && rows[0].dying &&
+           !rows[0].release && rows[1].hguid == 102 && rows[1].frozen && rows[1].release && !rows[1].dying);
+    PilotTable off = g.table, mine = g.table;
+    off.on = false;
+    mine.side = coop::pilot::kHost; // The host's own rows are its capture's, never driven.
+    assert(drawn(off, rows) == 0 && drawn(mine, rows) == 0);
+    const auto dispels = [&](uint32_t guid) {
+      size_t n = 0;
+      for (const Game::Cast &c : g.casts)
+        n += c.id == kDispel && c.la == g.by_guid[guid] && c.caster == c.la;
+      return n;
+    };
+    g.flags.refused[0] = 102;
+    g.flags.refused_count = 1;
+    frame(g, *e, t += 16); // The job takes the word at this turn's end, and lets the copy go at the next.
+    assert(dispels(502) == 0);
+    frame(g, *e, t += 16);
+    assert(dispels(502) == 1 && dispels(501) == 0 && count(g, "pilot refused") == 1 && e->counts.thawed == 1);
+    assert(drawn(g.table, rows) == 1 && rows[0].hguid == 101 && g.table.count == 2 &&
+           g.table.pairs[1].bits == kRowRelease + kRowExec);
+    g.flags.refused_count = 0;
+    for (uint32_t i = 0; i < 2 * kCensusTurns; ++i)
+      frame(g, *e, t += 16);
+    assert(dispels(502) == 1 && drawn(g.table, rows) == 1 && count(g, "pilot refused") == 1);
+  }
+  // Every way out takes our freeze off with BlockAI_Dispel, the copy its own caster: same_place off, the host lost (its
+  // off), coop fight off, a new session, a latch in the same turn, the glue's lift after a fault in our code, the game
+  // thread's pilot latch (none again this run). A freeze a fault in the game's code left is counted for the log.
+  for (int way = 0; way < 8; ++way) {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    const uint64_t la = g.by_guid[501];
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    assert(Game::held(g.body(501), kBlockAiState) && g.casts.size() == 2);
+    switch (way) {
+    case 0: g.inbox.push_back(msg("SBF11 place 1 0")); break;
+    case 1: g.inbox.push_back(msg("SBF11 off coop fight off")); break;
+    case 2: e->set(false, false); break;
+    case 3: e->set(true, false); break;
+    case 4: g.mem.put<float>(g.stat_at(501, kHp), std::nanf("")); break;
+    case 5:
+      e->latch("fault");
+      e->lift(g);
+      assert(e->forget() == 0);
+      break;
+    case 6:
+      e->latch("fault"); // In SB's code: nothing more called, the freeze counted for the log.
+      assert(e->forget() == 1 && e->forget() == 0 && g.casts.size() == 2);
+      continue;
+    default: e->stop_pilot(); break;
+    }
+    frame(g, *e, t += 16);
+    assert(g.casts.size() == 3 && g.casts[2].id == kDispel && g.casts[2].la == la && g.casts[2].caster == la);
+    frame(g, *e, t += 16);
+    assert(!Game::held(g.body(501), kBlockAiState) && e->counts.thawed == 1 && (g.table.count == 0 || !g.table.on));
+    for (uint32_t i = 0; i < 2 * kCensusTurns; ++i)
+      frame(g, *e, t += 16);
+    if (way == 0) { // The host's same_place on again: frozen again.
+      g.inbox.push_back(msg("SBF11 place 1 1"));
+      frame(g, *e, t += 16);
+      assert(g.casts.size() == 5 && g.casts[3].id == kBlockAi);
+    } else if (way == 7) { // The pilot latch holds for the run, a new session too.
+      e->set(true, false);
+      for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+        g.inbox.push_back(msg(line));
+      for (uint32_t i = 0; i < 2 * kCensusTurns; ++i)
+        frame(g, *e, t += 16);
+      assert(g.casts.size() == 3 && e->guest.linked() == 1 && !g.table.on);
+    } else {
+      assert(g.casts.size() == 3);
+    }
+  }
+  // The game refuses our BlockAI_Dispel (effect init under NoDamageNoHit, an immunity): said once, never counted as
+  // taken off, and tried again each turn while the session lasts; at its end, said as left frozen.
+  for (const bool end : {false, true}) {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    g.body(501).refuses = kDispel;
+    const auto dispels = [&] {
+      size_t n = 0;
+      for (const Game::Cast &c : g.casts)
+        n += c.id == kDispel;
+      return n;
+    };
+    if (end) {
+      e->set(false, false);
+      frame(g, *e, t += 16);
+      frame(g, *e, t += 16);
+      assert(dispels() == 1 && count(g, "thaw refused", "left frozen") == 1 && e->counts.thawed == 0);
+      assert(e->counts.thaw_refused == 1 && e->forget() == 0 && Game::held(g.body(501), kBlockAiState));
+      continue;
+    }
+    g.inbox.push_back(msg("SBF11 place 1 0"));
+    for (int k = 0; k < 3; ++k)
+      frame(g, *e, t += 16);
+    assert(dispels() == 3 && count(g, "thaw refused", "trying again") == 1 && count(g, "thaw refused") == 1);
+    assert(e->counts.thawed == 0 && e->counts.thaw_refused == 1 && Game::held(g.body(501), kBlockAiState));
+    g.body(501).refuses = 0;
+    frame(g, *e, t += 16);
+    frame(g, *e, t += 16);
+    assert(dispels() == 4 && count(g, "thawed", "after a refusal") == 1 && e->counts.thawed == 1);
+    assert(!Game::held(g.body(501), kBlockAiState) && e->forget() == 0);
+  }
+  // Freezes again count over any 10 s: five near the end of the first freeze's 10 s and a sixth just past it is one
+  // too many.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    while (t < kRefreezeMs - 1500)
+      frame(g, *e, t += 16);
+    assert(e->counts.frozen == 1 && e->counts.refrozen == 0);
+    const auto again = [&] {
+      g.dispel(501);
+      for (uint32_t i = 0; i < kCensusTurns; ++i)
+        frame(g, *e, t += 16);
+    };
+    for (int k = 0; k < 5; ++k)
+      again();
+    assert(t < kRefreezeMs && e->counts.refrozen == 5);
+    while (t < kRefreezeMs)
+      frame(g, *e, t += 16);
+    again();
+    assert(e->counts.refrozen == 5 && e->counts.freeze_lost == 1);
+  }
+  // A crowd control we mirror starts inside SB's call: a copy given one in this turn is not frozen in it (SkillCancel
+  // would cut it), and is once it ends.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    assert(e->guest.linked() == 1 && g.casts.empty());
+    g.inbox.push_back(msg("SBF11 place 1 1"));
+    g.inbox.push_back(msg("SBF11 cc 1 101 3000300"));
+    frame(g, *e, t += 16);
+    assert(g.casts.size() == 1 && g.casts[0].id == 3000300 && e->counts.frozen == 0);
+    while (g.in_cc(g.by_guid[501]))
+      frame(g, *e, t += 16);
+    assert(g.casts.size() == 1);
+    frame(g, *e, t += 16);
+    assert(g.casts.size() == 3 && g.casts[1].id == kBlockAi && e->counts.frozen == 1);
+  }
+  // More pairs than the table's rows (16 live and a kill held): the held one comes last, so every live copy is drawn.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.inbox.push_back(msg("SBF11 world 1"));
+    g.inbox.push_back(msg("SBF11 place 1 1"));
+    for (uint32_t i = 0; i < kMaxPairs + 1; ++i) {
+      g.spawn(501 + i, 5001 + i, 0);
+      if (i < kMaxPairs)
+        g.inbox.push_back(msg(("SBF11 up 1 " + std::to_string(101 + i) + " " + std::to_string(5001 + i) +
+                               " 0 900 1600").c_str()));
+    }
+    uint64_t t = 0;
+    frame(g, *e, t);
+    assert(e->guest.linked() == kMaxPairs && e->counts.frozen == kMaxPairs);
+    g.state(501, kNoDamageNoHit, 1);
+    g.inbox.push_back(msg("SBF11 dead 1 101"));
+    g.inbox.push_back(msg("SBF11 up 1 117 5017 0 900 1600"));
+    for (uint32_t i = 0; i <= kCensusTurns; ++i)
+      frame(g, *e, t += 16);
+    assert(count(g, "kill held") == 1 && g.table.count == kMaxPairs && e->counts.frozen == kMaxPairs + 1);
+    for (uint8_t r = 0; r < g.table.count; ++r)
+      assert(g.table.pairs[r].local != 501 && (g.table.pairs[r].bits & kRowDrawn));
+  }
+  // A table the job no longer fills is published empty: a probe session started in the turn after an off, and a net
+  // mode other than 0.
+  for (const bool probe : {true, false}) {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, 0);
+    frame(g, *e, 16);
+    assert(g.table.on && g.table.count == 1);
+    if (probe) {
+      e->set(false, false);
+      e->set(true, false, true);
+    } else {
+      g.mem.put<int32_t>(g.net + kNetMode, 1);
+    }
+    frame(g, *e, 32);
+    assert(!g.table.on && g.table.count == 0 && g.table.turn == 2 && e->counts.mode == (probe ? 0 : 1));
+  }
+
+  // The host's same_place decides for both games: the guest's own is never read, so her copies are frozen only while
+  // the host's last place line says on. coop fight pilot off (pilot_off) turns same-place enemies off on either side
+  // until the next start, and the pilot's latch for the run: the host then tells her place 0 and its table stops its
+  // capture. The snapshot says why they do not run ("host", "asked", "stopped"), or how many pairs they move.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true); // Hers: never read.
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    assert(!g.table.on && g.casts.empty() && !std::strcmp(e->snapshot().pilot_why, "host"));
+    assert(e->snapshot().piloted == 0);
+    e->same_place(false);
+    g.inbox.push_back(msg("SBF11 place 1 1"));
+    frame(g, *e, t += 16);
+    assert(g.table.on && g.casts.size() == 2 && !e->snapshot().pilot_why && e->snapshot().piloted == 1);
+    e->pilot_off(true);
+    frame(g, *e, t += 16);
+    assert(!g.table.on && g.casts.size() == 3 && g.casts[2].id == kDispel);
+    assert(!std::strcmp(e->snapshot().pilot_why, "asked") && e->snapshot().piloted == 0);
+    for (uint32_t i = 0; i < 2 * kCensusTurns; ++i)
+      frame(g, *e, t += 16);
+    e->pilot_off(false);
+    frame(g, *e, t += 16);
+    assert(g.table.on && g.casts.size() == 5 && g.casts[3].id == kBlockAi && e->snapshot().piloted == 1);
+    e->stop_pilot();
+    frame(g, *e, t += 16);
+    assert(!g.table.on && g.casts.size() == 6 && !std::strcmp(e->snapshot().pilot_why, "stopped"));
+  }
+  // On the guest's side "host" means the host's list came and says place 0. The host's off line (a load, photo mode),
+  // its on line (a restart) and the wait for its world say "fight", as the shared fight's own notices do.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    uint64_t t = 0;
+    const auto why = [&](std::initializer_list<const char *> in) {
+      for (const char *line : in)
+        g.inbox.push_back(msg(line));
+      frame(g, *e, t += 16);
+      const char *w = e->snapshot().pilot_why;
+      return std::string(w ? w : "on");
+    };
+    assert(why({}) == "fight");
+    assert(why({"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"}) == "on");
+    assert(why({"SBF11 off photo mode"}) == "fight");
+    assert(why({"SBF11 on"}) == "fight");
+    assert(why({"SBF11 world 2"}) == "host"); // Its list, with no place line: the host's same_place is off.
+    assert(why({"SBF11 place 2 1", "SBF11 up 2 101 5001 0 900 1600"}) == "on");
+    assert(why({"SBF11 place 2 0"}) == "host");
+  }
+  {
+    Game g;
+    auto e = engine(true, true);
+    g.spawn(101, 5001, 0);
+    g.spawn(102, 5002, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 0);
+    const std::string gen = std::to_string(e->host.gen());
+    assert(!g.table.on && !has(lines(g), "place") && !std::strcmp(e->snapshot().pilot_why, "setting"));
+    e->same_place(true);
+    frame(g, *e, 16);
+    assert(g.table.on && lines(g) == "SBF11 place " + gen + " 1\n" && e->snapshot().piloted == 2);
+    e->pilot_off(true);
+    frame(g, *e, 32);
+    assert(!g.table.on && lines(g) == "SBF11 place " + gen + " 0\n" && !std::strcmp(e->snapshot().pilot_why, "asked"));
+    e->pilot_off(false);
+    frame(g, *e, 48);
+    assert(g.table.on && lines(g) == "SBF11 place " + gen + " 1\n");
+    g.inbox.push_back(msg("SBF11 off photo mode")); // Her side off: no capture, no line.
+    frame(g, *e, 64);
+    assert(!g.table.on && !has(lines(g), "place") && !std::strcmp(e->snapshot().pilot_why, "fight"));
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 80);
+    assert(g.table.on && has(lines(g), "SBF11 place " + gen + " 1\n"));
+    e->stop_pilot();
+    frame(g, *e, 96);
+    assert(!g.table.on && lines(g) == "SBF11 place " + gen + " 0\n");
+    assert(!std::strcmp(e->snapshot().pilot_why, "stopped") && e->snapshot().piloted == 0);
+  }
+
+  // ---- Same-place enemies, stage 3b (PHASE11-STAGE3 3.8), the host's side ----
+  // Her claim as the last hit gives her the enemy once the host held it 4 s: in that turn the host freezes its copy
+  // (BlockAI_Infinite, then SkillCancel) and sends own G at the next epoch, and the pair is drawn (her stream drives
+  // it). Her own-no at that epoch gives it back in the turn it comes: BlockAI_Dispel, captured again, and not hers
+  // again for 30 s, her claims or not; one at another epoch, of another world, or twice changes nothing. Our own hit
+  // takes it back once she held it 4 s: own H and the
+  // dispel in one turn. Never while an AI task runs on the owner's copy (ours as read at +0x744, which our SBE carries
+  // as kSkill; hers as her stream says), and the nearer rule once nobody hit it for 10 s. aggro=host keeps it ours;
+  // place 0 gives it back with its epoch kept; her off starts the epochs over. Only a pair ours by a hand-over is
+  // marked taken (our game thread forces its target): never one back by her own-no or by place 0.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    const uint64_t la = g.by_guid[101];
+    g.inbox.push_back(msg("SBF11 on"));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    assert(g.table.on && has(lines(g), "SBF11 place 1 1\n"));
+    const PilotPair &row = g.table.pairs[0];
+    size_t seen = 0, claim = 0;
+    const auto casts = [&] { // The effect IDs cast on 101 since the last look.
+      std::string ids;
+      for (; seen < g.casts.size(); ++seen)
+        if (g.casts[seen].la == la && g.casts[seen].caster == la)
+          ids += std::to_string(g.casts[seen].id) + " ";
+      return ids;
+    };
+    const auto hers = [&](uint64_t at) { // Her claim of 10 balance.
+      g.inbox.push_back(msg("SBF11 hit 1 " + std::to_string(++claim) + " 101 0 0 10 1590 0"));
+      frame(g, *e, t = at);
+    };
+    const auto until = [&](uint64_t end, const std::string &line) { // Frames until the line goes out.
+      for (std::string sent; t < end; frame(g, *e, t += 16))
+        if (has(sent = lines(g), line))
+          return true;
+      return false;
+    };
+    hers(1008); // Frames every 16 ms from 0.
+    assert(row.owner == coop::pilot::kHost && !until(3984, "own"));
+    assert(until(4100, "SBF11 own 1 101 G 1\n") && t == 4000 && casts() == std::to_string(kBlockAi) + " " +
+                                                                           std::to_string(kSkillCancel) + " ");
+    assert(row.owner == coop::pilot::kGuest && row.oe == 1 && row.bits == kRowDrawn && e->counts.owns == 1 &&
+           count(g, "own", "to her") == 1);
+    frame(g, *e, t += 16);
+    assert(row.bits == (kRowDrawn | kRowFrozen) && casts().empty());
+    coop::pilot::Owned o[kMaxPairs];
+    assert(owned(g.table, o) == 0); // Drawn: never ours to capture (R35).
+    g.inbox.push_back(msg("SBF11 own-no 1 101 1 state"));
+    frame(g, *e, t = 4496);
+    assert(casts() == std::to_string(kDispel) + " " && row.owner == coop::pilot::kHost && row.oe == 1 &&
+           !(row.bits & kRowDrawn) && e->counts.own_nos == 1 && count(g, "own-no", "state") == 1);
+    assert(owned(g.table, o) == 1 && o[0].hguid == 101 && o[0].oe == 1 && !o[0].taken && !(row.bits & kRowTaken));
+    const uint64_t stale = e->host.counts.stale;
+    for (const char *late : {"SBF11 own-no 1 101 1 state", "SBF11 own-no 1 101 0 off", "SBF11 own-no 1 101 7 off",
+                             "SBF11 own-no 2 101 1 off", "SBF11 own-no 1 102 1 off"})
+      g.inbox.push_back(msg(late));
+    frame(g, *e, t += 16);
+    assert(e->host.counts.stale == stale + 5 && e->host.counts.bad == 0 && row.owner == coop::pilot::kHost);
+    // Not hers again for 30 s after her own-no, however often she hits it; then at once.
+    for (uint64_t at = 4496 + 2000; at < 4496 + 30000; at += 2000) {
+      assert(!until(at, "own"));
+      hers(at);
+    }
+    assert(until(4496 + 30100, "SBF11 own 1 101 G 2\n") && t == 4496 + 30000);
+    const uint64_t g2 = t;
+    // Ours by our hit once she held it 4 s; her stream's kSkill holds it back meanwhile.
+    frame(g, *e, t += 16);
+    casts();
+    g.hit(101, kShield, 5);
+    frame(g, *e, t = g2 + 512);
+    g.flags.skill[0] = 101, g.flags.skill_count = 1;
+    assert(!until(g2 + 4504, "own"));
+    g.flags.skill_count = 0;
+    assert(until(g2 + 4604, "SBF11 own 1 101 H 3\n") && casts() == std::to_string(kDispel) + " ");
+    assert(row.owner == coop::pilot::kHost && row.oe == 3 && !(row.bits & kRowDrawn) && count(g, "own", "back") == 1);
+    assert(owned(g.table, o) == 1 && o[0].oe == 3 && o[0].taken);
+    // An AI task on our copy: no hand-over while it runs (and our SBE says kSkill).
+    g.mem.put<int32_t>(g.fsb(101) + kAiTask, 3);
+    hers(t + 96);
+    const uint64_t her_hit = t;
+    assert(owned(g.table, o) == 1 && o[0].flags == coop::pilot::kSkill && (row.bits & kRowSkill));
+    assert(!until(t + 6000, "own"));
+    g.mem.put<int32_t>(g.fsb(101) + kAiTask, 0);
+    assert(until(t + 100, "SBF11 own 1 101 G 4\n"));
+    // Nearer: once nobody hit it for 10 s, our EVE 3 m closer than hers for 2 s takes it back. Her ghost drawn 9 s
+    // after her hit: the 2 s count from then (the job reads the game thread's word a turn late).
+    const uint64_t enemy = g.fsb(101) + kLocation, ours = g.fsb(1) + kLocation;
+    for (int k = 0; k < 3; ++k) {
+      g.mem.put<float>(enemy + 4 * size_t(k), 0);
+      g.mem.put<float>(ours + 4 * size_t(k), k ? 0.f : 100.f);
+    }
+    assert(!until(her_hit + 9000, "own"));
+    g.flags.her[0] = 1000, g.flags.her_ok = true;
+    const uint64_t near_from = t;
+    assert(!until(near_from + 1984, "own") && until(near_from + 2100, "SBF11 own 1 101 H 5\n"));
+    g.flags.her_ok = false;
+    // aggro=host: told at once, and nothing goes to her.
+    e->aggro(true);
+    frame(g, *e, t += 16);
+    assert(has(lines(g), "SBF11 aggro 1 host\n"));
+    hers(t + 100);
+    assert(!until(t + 12000, "own"));
+    e->aggro(false);
+    hers(t + 100);
+    assert(until(t + 4100, "SBF11 own 1 101 G 6\n") && row.oe == 6);
+    // place 0: back to us, its epoch kept; on again, the next hand-over at the next epoch.
+    casts();
+    e->same_place(false);
+    frame(g, *e, t += 16);
+    assert(has(lines(g), "SBF11 place 1 0\n") && row.owner == coop::pilot::kHost && row.oe == 6 && !g.table.on);
+    assert(casts() == std::to_string(kDispel) + " ");
+    e->same_place(true);
+    frame(g, *e, t += 16);
+    assert(g.table.on && owned(g.table, o) == 1 && o[0].oe == 6 && !o[0].taken);
+    hers(t + 5000);
+    assert(until(t + 100, "SBF11 own 1 101 G 7\n") &&
+           casts() == std::to_string(kBlockAi) + " " + std::to_string(kSkillCancel) + " ");
+    // Her off: the epochs start over, and nothing is frozen any more.
+    g.inbox.push_back(msg("SBF11 off photo mode"));
+    frame(g, *e, t += 16);
+    assert(!g.table.on && row.owner == coop::pilot::kHost && row.oe == 0 && casts() == std::to_string(kDispel) + " ");
+    frame(g, *e, t += 16);
+    assert(!Game::held(g.body(101), kBlockAiState) && e->host.counts.bad == 0);
+  }
+  // A pair whose copy the host cannot draw (its game thread refused it, or its freeze was lost) stays the host's: taken
+  // back from her at once (her 4 s and her stream's AI task or not), never handed over again.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    std::string sent;
+    uint64_t t = 0;
+    for (; t <= 4000; t += 16) {
+      if (t == 16) // Once the enemy is in the host's list.
+        g.inbox.push_back(msg("SBF11 hit 1 1 101 0 0 10 1590 0"));
+      frame(g, *e, t), sent += lines(g);
+    }
+    assert(has(sent, "SBF11 own 1 101 G 1\n") && g.table.pairs[0].owner == coop::pilot::kGuest);
+    g.flags.refused[0] = 101, g.flags.refused_count = 1;
+    g.flags.skill[0] = 101, g.flags.skill_count = 1;
+    for (sent.clear(); t <= 4064; t += 16) // The word comes a turn late, and the copy is lost from the next turn.
+      frame(g, *e, t), sent += lines(g);
+    assert(has(sent, "SBF11 own 1 101 H 2\n") && count(g, "pilot refused") == 1);
+    g.flags.refused_count = g.flags.skill_count = 0;
+    g.inbox.push_back(msg("SBF11 hit 1 2 101 0 0 10 1580 0"));
+    for (sent.clear(); t <= 20000; t += 16)
+      frame(g, *e, t), sent += lines(g);
+    assert(!has(sent, "own") && g.table.pairs[0].owner == coop::pilot::kHost && !(g.table.pairs[0].bits & kRowDrawn));
+    assert(!Game::held(g.body(101), kBlockAiState));
+  }
+  // Her own-no about a pair (here unpaired: her game has no copy of it) keeps it the host's for 30 s, though her ghost
+  // stands 10 m nearer to it all along; then the nearer rule hands it to her again.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    g.mem.put<float>(g.fsb(1) + kLocation, 1000.f); // Our EVE 10 m away; the enemy and her ghost at 0.
+    g.flags.her_ok = true;
+    g.inbox.push_back(msg("SBF11 on"));
+    uint64_t t = 0;
+    const auto until = [&](uint64_t end, const std::string &line) {
+      for (std::string sent; t < end; frame(g, *e, t += 16))
+        if (has(sent = lines(g), line))
+          return true;
+      return false;
+    };
+    assert(until(4100, "SBF11 own 1 101 G 1\n"));
+    g.inbox.push_back(msg("SBF11 own-no 1 101 1 unpaired"));
+    frame(g, *e, t += 16);
+    const uint64_t no = t;
+    assert(g.table.pairs[0].owner == coop::pilot::kHost && !until(no + 29984, "own"));
+    assert(until(no + 30100, "SBF11 own 1 101 G 2\n") && t == no + 30000 && e->counts.owns == 2);
+  }
+  // The guards of the host's, read on its copy, hold a hand-over back while they last: a takedown marker
+  // (Check_LinkSkillHit_Skill 5000039), Groggy, DelayDeath, NoDamageNoHit; own G in the turn after each ends, but after
+  // the marker, which is the host's own takedown and its last hit (stage 3c), only at her next hit. Her
+  // own-no off (her side does not run same-place enemies) pauses hand-overs for 30 s, her claims or not, then one goes
+  // again; her world ends the pause at once. Her lethal claim on a pair the host held over 4 s kills it with no own
+  // line: the enemy leaves the host's list in that step.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    g.spawn(102, 5002, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    size_t claim = 0;
+    const auto hers = [&](uint64_t at) {
+      g.inbox.push_back(msg("SBF11 hit 1 " + std::to_string(++claim) + " 101 0 0 10 1590 0"));
+      frame(g, *e, t = at);
+    };
+    const auto until = [&](uint64_t end, const std::string &line) {
+      for (std::string sent; t < end; frame(g, *e, t += 16))
+        if (has(sent = lines(g), line))
+          return true;
+      return false;
+    };
+    const auto guard = [&](int which, bool on) {
+      if (which == 0)
+        on ? g.knock(101, 5000039) : g.end(101, 5000039);
+      else
+        g.state(101, which == 1 ? 7 : which == 2 ? kDelayDeath : kNoDamageNoHit, on);
+    };
+    for (int which = 0; which < 4; ++which) {
+      const uint64_t held = t; // Ours since: the start, then her world line (an own-no would pause it 30 s).
+      hers(held + 100);
+      assert(!until(held + 3800, "own"));
+      guard(which, true); // The marker's 60 turns outlast what follows.
+      assert(!until(held + 4600, "own"));
+      guard(which, false);
+      if (which == 0) {
+        assert(!until(t + 2000, "own"));
+        hers(t + 16);
+      }
+      assert(until(t + 100, "SBF11 own 1 101 G 1\n"));
+      g.inbox.push_back(msg("SBF11 world 1")); // The epochs start over.
+      frame(g, *e, t += 16);
+    }
+    hers(t + 100);
+    assert(until(t + 4100, "SBF11 own 1 101 G 1\n"));
+    g.inbox.push_back(msg("SBF11 own-no 1 101 1 off"));
+    frame(g, *e, t += 16);
+    const uint64_t off = t;
+    for (uint64_t at = off + 2000; at < off + 30000; at += 2000) {
+      assert(!until(at, "own"));
+      hers(at);
+    }
+    assert(until(off + 30100, "SBF11 own 1 101 G 2\n") && t == off + 30000);
+    g.inbox.push_back(msg("SBF11 own-no 1 101 2 aggro"));
+    frame(g, *e, t += 16);
+    g.inbox.push_back(msg("SBF11 world 1")); // Her world: the pause ends, and the epochs start over.
+    frame(g, *e, t += 16);
+    hers(t + 16);
+    assert(until(t + 4100, "SBF11 own 1 101 G 1\n"));
+    g.inbox.push_back(msg("SBF11 hit 1 " + std::to_string(++claim) + " 102 99999 0 0 1600 1"));
+    frame(g, *e, t += 16);
+    const std::string sent = lines(g);
+    assert(has(sent, "SBF11 dead 1 102\n") && !has(sent, "own") && e->host.counts.bad == 0);
+  }
+  // Her place, down and dead are bad lines on the host's side (R33) and leave the owners alone: a pair she owns stays
+  // hers and drawn. Once 16 bad lines ignore her, every pair she owns comes back in that turn (own H), guards or not.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    g.spawn(101, 5001, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    std::string sent;
+    uint64_t t = 0;
+    for (; t <= 4000; t += 16) {
+      if (t == 16)
+        g.inbox.push_back(msg("SBF11 hit 1 1 101 0 0 10 1590 0"));
+      frame(g, *e, t), sent += lines(g);
+    }
+    const PilotPair &row = g.table.pairs[0];
+    assert(has(sent, "SBF11 own 1 101 G 1\n") && row.owner == coop::pilot::kGuest);
+    g.flags.skill[0] = 101, g.flags.skill_count = 1; // Her stream's AI task on it.
+    for (const char *line : {"SBF11 place 1 0", "SBF11 dead 1 101", "SBF11 down 1 101"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, t += 16);
+    assert(!has(lines(g), "own") && e->host.counts.bad == 3 && !e->host.ignored());
+    assert(row.owner == coop::pilot::kGuest && row.oe == 1 && (row.bits & kRowDrawn) && g.table.on);
+    for (int i = 0; i < 13; ++i)
+      g.inbox.push_back(msg("SBF11 place 1 0"));
+    frame(g, *e, t += 16);
+    assert(e->host.ignored() && has(lines(g), "SBF11 own 1 101 H 2\n"));
+    assert(row.owner == coop::pilot::kHost && !(row.bits & kRowDrawn));
+  }
+  // ---- Stage 3b, the guest's side ----
+  // An own G at her epoch plus one, for a paired copy in life state 1 while same-place enemies run here: hers, her
+  // freeze off (BlockAI_Dispel) in that turn, captured from then on. An own H: drawn and frozen again at once. Else the
+  // host's at the line's epoch and own-no: her copy in NoDamageNoHit (state), an epoch skipped (epoch, a bad line), no
+  // such pair (unpaired), the host's aggro=host (aggro). Another world's line: nothing. A pair she owns goes back with
+  // own-no when same-place enemies stop here (off) or her copy is gone (unpaired); the host's place 0 gives it back
+  // without a word.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    const uint64_t la = g.by_guid[501];
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    lines(g);
+    const PilotPair &row = g.table.pairs[0];
+    assert(row.bits == (kRowDrawn | kRowFrozen) && row.owner == coop::pilot::kHost);
+    size_t seen = 0;
+    const auto casts = [&] {
+      std::string ids;
+      for (; seen < g.casts.size(); ++seen)
+        if (g.casts[seen].la == la && g.casts[seen].caster == la)
+          ids += std::to_string(g.casts[seen].id) + " ";
+      return ids;
+    };
+    casts();
+    const auto own = [&](const std::string &line) {
+      g.inbox.push_back(msg(line));
+      frame(g, *e, t += 16);
+      return lines(g);
+    };
+    coop::pilot::Owned o[kMaxPairs];
+    assert(own("SBF11 own 1 101 G 1").empty() && casts() == std::to_string(kDispel) + " ");
+    assert(row.owner == coop::pilot::kGuest && row.oe == 1 && !(row.bits & kRowDrawn) && e->counts.owns == 1);
+    assert(owned(g.table, o) == 1 && o[0].hguid == 101 && o[0].local == 501 && o[0].oe == 1 && o[0].taken);
+    assert(count(g, "own", "taken") == 1);
+    frame(g, *e, t += 16);
+    assert(!Game::held(g.body(501), kBlockAiState));
+    assert(own("SBF11 own 1 101 H 2").empty() && casts() == std::to_string(kBlockAi) + " " +
+                                                               std::to_string(kSkillCancel) + " ");
+    assert(row.owner == coop::pilot::kHost && row.oe == 2 && (row.bits & kRowDrawn));
+    g.state(501, kNoDamageNoHit, 1);
+    assert(own("SBF11 own 1 101 G 3") == "SBF11 own-no 1 101 3 state\n" && casts().empty());
+    assert(row.owner == coop::pilot::kHost && row.oe == 3 && (row.bits & kRowDrawn) && e->counts.own_nos == 1);
+    g.state(501, kNoDamageNoHit, 0);
+    const uint64_t bad = e->guest.counts.bad;
+    assert(own("SBF11 own 1 101 G 5") == "SBF11 own-no 1 101 5 epoch\n" && e->guest.counts.bad == bad + 1);
+    assert(own("SBF11 own 1 999 G 1") == "SBF11 own-no 1 999 1 unpaired\n");
+    const uint64_t stale = e->guest.counts.stale;
+    assert(own("SBF11 own 2 101 G 6").empty() && e->guest.counts.stale == stale + 1 && row.oe == 5);
+    g.inbox.push_back(msg("SBF11 aggro 1 host"));
+    assert(own("SBF11 own 1 101 G 6") == "SBF11 own-no 1 101 6 aggro\n");
+    g.inbox.push_back(msg("SBF11 aggro 1 game"));
+    assert(own("SBF11 own 1 101 G 7").empty() && row.owner == coop::pilot::kGuest &&
+           casts() == std::to_string(kDispel) + " ");
+    e->pilot_off(true); // coop fight pilot off here: given back, her copy local.
+    frame(g, *e, t += 16);
+    assert(lines(g) == "SBF11 own-no 1 101 7 off\n" && row.owner == coop::pilot::kHost && !g.table.on);
+    e->pilot_off(false);
+    frame(g, *e, t += 16);
+    assert(row.owner == coop::pilot::kHost && row.oe == 7 && (row.bits & kRowDrawn) &&
+           casts() == std::to_string(kBlockAi) + " " + std::to_string(kSkillCancel) + " ");
+    assert(own("SBF11 own 1 101 G 8").empty() && row.owner == coop::pilot::kGuest);
+    g.inbox.push_back(msg("SBF11 place 1 0")); // The host's same place off: back to it, no word.
+    frame(g, *e, t += 16);
+    assert(lines(g).empty() && row.owner == coop::pilot::kHost && row.oe == 8 && !g.table.on);
+    g.inbox.push_back(msg("SBF11 place 1 1"));
+    frame(g, *e, t += 16);
+    assert(own("SBF11 own 1 101 G 9").empty() && row.owner == coop::pilot::kGuest);
+    g.unlink(501); // Her copy gone from the map: unpaired, given back.
+    frame(g, *e, t += 16);
+    assert(lines(g) == "SBF11 own-no 1 101 9 unpaired\n" && g.table.count == 0 && e->counts.own_nos == 6);
+    assert(!e->latched());
+  }
+  // Her game thread refused the take-over (pilot.h's Taker: SB's force target needs net mode 0 and no logic task in
+  // flight): the pair goes back with own-no target at her epoch, drawn and frozen again in that turn. A refusal that
+  // names another epoch changes nothing.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    const uint64_t la = g.by_guid[501];
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    lines(g);
+    g.inbox.push_back(msg("SBF11 own 1 101 G 1"));
+    frame(g, *e, t += 16);
+    const PilotPair &row = g.table.pairs[0];
+    assert(lines(g).empty() && row.owner == coop::pilot::kGuest && row.oe == 1);
+    g.flags.untaken[0] = 101, g.flags.untaken_oe[0] = 0, g.flags.untaken_count = 1;
+    frame(g, *e, t += 16);
+    frame(g, *e, t += 16);
+    assert(lines(g).empty() && row.owner == coop::pilot::kGuest);
+    const size_t casts = g.casts.size();
+    g.flags.untaken_oe[0] = 1;
+    frame(g, *e, t += 16); // The flags reach the job at this turn's end,
+    frame(g, *e, t += 16); // and its answers at the next.
+    assert(lines(g) == "SBF11 own-no 1 101 1 target\n" && count(g, "own-no", "target") == 1);
+    assert(row.owner == coop::pilot::kHost && row.oe == 1 && (row.bits & kRowDrawn) && e->counts.own_nos == 1);
+    assert(g.casts.size() == casts + 2 && g.casts[casts].la == la && g.casts[casts].id == kBlockAi);
+    frame(g, *e, t += 16); // Still named by the game thread: the pair is the host's now, nothing more to say.
+    assert(lines(g).empty() && e->counts.own_nos == 1);
+  }
+  // The host's own line and its dead for the same enemy in one turn of hers: the own line is stale (counted), never an
+  // own-no or a bad line, and leaves no entry behind.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    for (const char *line : {"SBF11 own 1 101 G 1", "SBF11 own 1 101 H 2"}) {
+      g.inbox.push_back(msg(line));
+      frame(g, *e, t += 16);
+    }
+    assert(lines(g).find("own-no") == std::string::npos && g.table.pairs[0].oe == 2);
+    const uint64_t bad = e->guest.counts.bad, stale = e->guest.counts.stale;
+    for (const char *line : {"SBF11 own 1 101 G 3", "SBF11 dead 1 101"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, t += 16);
+    assert(!has(lines(g), "own-no") && e->guest.counts.bad == bad && e->guest.counts.stale == stale + 1);
+  }
+  // ---- Stage 3b, two worlds through channel 2: 90-150 ms each way, in order ----
+  // Three paired enemies. Enemy 0 goes to her by her hit at 5 s, back by the host's at 12 s, to her again at 20 s and
+  // back by the nearer rule 10 s later. Enemy 1 nobody hits: hers by the nearer rule while her EVE stands by it (6 s to
+  // 18 s), then the host's. Enemy 2: her hit at 5.5 s while her copy holds NoDamageNoHit (a grab), so she refuses it
+  // and it comes back; hers at her next hit, at 37 s (none goes to her for 30 s after her own-no about it). On each
+  // frame each enemy runs SB's AI on one copy (state 39 off on it)
+  // but in a hand-over: a hand-over leaves 0 or 2 for one hop at most (the one-way delay and the receiver's turn), a
+  // refused one 0 for a round trip (two hops). No pair at an epoch is ever captured by both sides, and between
+  // hand-overs the side that does not own a pair draws it at the owner's epoch (R35). Then the link goes: every copy
+  // local, none frozen.
+  {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_place(true);
+    for (uint32_t i = 0; i < 3; ++i) {
+      H.spawn(100 + i, 7000 + i, 0);
+      G.spawn(900 + i, 7000 + i, 0);
+      for (int k = 0; k < 3; ++k)
+        H.mem.put<float>(H.fsb(100 + i) + kLocation + 4 * size_t(k), k ? 0.f : 5000.f * float(i));
+    }
+    const auto at = [&](float *p, float x, float y) { p[0] = x, p[1] = y, p[2] = 0; };
+    float eve[3];
+    at(eve, -3000, 0);
+    for (int k = 0; k < 3; ++k)
+      H.mem.put<float>(H.fsb(1) + kLocation + 4 * size_t(k), eve[k]);
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(5);
+    std::map<std::pair<uint32_t, uint8_t>, int> captured; // (hguid, epoch): the side that captured it.
+    uint64_t bad_since[3] = {}, worst_hop = 0, worst_trip = 0;
+    int bad_kind[3] = {};
+    size_t windows = 0, trips = 0, agreed = 0;
+    for (uint64_t t = 0; t <= 40000; t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      G.state(902, kNoDamageNoHit, t >= 5000 && t < 7000);
+      H.flags.her_ok = t >= 6000;
+      at(H.flags.her, t < 18000 ? 5000.f : -3000.f, t < 18000 ? 100.f : 5000.f);
+      if (t == 4992 || t == 20000) // Frames every 16 ms.
+        G.hit(900, kStamina, 10);
+      if (t == 12000)
+        H.hit(100, kShield, 5);
+      if (t == 5504 || t == 37008)
+        G.hit(902, kStamina, 10);
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      for (const auto &[X, side] : {std::pair<Game *, int>{&H, 0}, {&G, 1}}) {
+        coop::pilot::Owned o[kMaxPairs];
+        const size_t n = owned(X->table, o);
+        for (size_t k = 0; k < n && X->table.on; ++k) {
+          const auto key = std::make_pair(o[k].hguid, o[k].oe);
+          assert(!captured.count(key) || captured[key] == side);
+          captured[key] = side;
+        }
+      }
+      for (uint32_t i = 0; i < 3 && t >= 2000; ++i) {
+        const int ai = !Game::held(H.body(100 + i), kBlockAiState) + !Game::held(G.body(900 + i), kBlockAiState);
+        if (ai != 1 && !bad_since[i])
+          bad_since[i] = t, bad_kind[i] = ai;
+        if (ai == 1 && bad_since[i]) {
+          const uint64_t took = t - bad_since[i];
+          const bool trip = i == 2 && bad_since[i] < 6000; // The refused hand-over: own G, then her own-no back.
+          (trip ? worst_trip : worst_hop) = std::max(trip ? worst_trip : worst_hop, took);
+          ++windows, trips += trip, bad_since[i] = 0;
+        }
+        assert(!bad_since[i] || bad_kind[i] == ai); // 0 or 2, never one turning into the other.
+      }
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+      if (to_host.queue.empty() && to_guest.queue.empty() && t >= 2000) { // Nothing in flight: one owner each.
+        for (uint32_t i = 0; i < 3; ++i) {
+          const PilotPair *h = nullptr, *g = nullptr;
+          for (uint8_t r = 0; r < H.table.count; ++r)
+            h = H.table.pairs[r].hguid == 100 + i ? &H.table.pairs[r] : h;
+          for (uint8_t r = 0; r < G.table.count; ++r)
+            g = G.table.pairs[r].hguid == 100 + i ? &G.table.pairs[r] : g;
+          assert(h && g && h->owner == g->owner && h->oe == g->oe);
+          assert(((h->bits & kRowDrawn) != 0) == (h->owner == coop::pilot::kGuest));
+          assert(((g->bits & kRowDrawn) != 0) == (g->owner == coop::pilot::kHost));
+        }
+        ++agreed;
+      }
+    }
+    const uint64_t hop = 150 + 16; // The one-way delay at most, and the receiver's turn.
+    std::printf("fight_engine_test: stage 3b two worlds, 40 s: %zu hand-overs, %llu own-no; 0 or 2 AI copies at most "
+                "%llu ms a hand-over, %llu ms a refused one; %zu frames with nothing in flight\n",
+                windows, static_cast<unsigned long long>(eg->counts.own_nos),
+                static_cast<unsigned long long>(worst_hop), static_cast<unsigned long long>(worst_trip), agreed);
+    assert(windows == 8 && trips == 1 && worst_hop <= hop && worst_trip <= 2 * hop && worst_trip > 2 * 90);
+    assert(eh->counts.owns == 8 && eg->counts.owns == 4 && eh->counts.own_nos == 1 && eg->counts.own_nos == 1);
+    assert(eh->host.counts.bad == 0 && eg->guest.counts.bad == 0 && !eh->latched() && !eg->latched());
+    // The link goes: each side's session ends (the worker's pause), and every freeze comes off at its next turn.
+    eh->set(false, true);
+    eg->set(false, false);
+    for (uint64_t t = 40016; t <= 40080; t += 16) {
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+    }
+    for (uint32_t i = 0; i < 3; ++i)
+      assert(!Game::held(H.body(100 + i), kBlockAiState) && !Game::held(G.body(900 + i), kBlockAiState));
+    assert(!H.table.on && !G.table.on);
+  }
+
+  // ---- Same-place enemies, stage 3c (PHASE11-STAGE3 3.9): takedowns, the host's side ----
+  // 101: her exec 1 for a pair the host owns, its copy groggy: own G in that turn, past the 4 s hold and the Groggy
+  // guard, and the host's copy frozen in that turn although Groggy releases it (it plays her takedown from her stream).
+  // Her lethal claim then waits at 1 HP until her exec 0, which lets the kill go in that turn, our freeze off first.
+  // 102: a hit of the host's during her takedown changes nothing, so the pair stays hers after it. 103: the host's own
+  // takedown (a marker on its copy) takes back a pair she took 0.5 s before, and its capture says kExec while the
+  // marker holds; her next exec 1 hands it to her again, and with no exec 0 her lethal claim goes 6 s after her exec 1
+  // (held-expired). Her exec 1 for a copy of ours with no Groggy or marker is refused, and so is one for a BossMonster
+  // (104, shared here by its charId): boss finishers stay the host's.
+  {
+    Game g;
+    auto e = engine(true, true);
+    e->same_place(true);
+    for (uint32_t i = 0; i < 3; ++i)
+      g.spawn(101 + i, 5001 + i, 0);
+    g.spawn(104, 5004, 0, kChar, 1600, 4);
+    g.state(104, 7, 1);
+    g.spawn(105, 5005, 0);
+    g.spawn(106, 5006, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    lines(g);
+    const auto row = [&](uint32_t h) {
+      for (uint8_t r = 0; r < g.table.count; ++r)
+        if (g.table.pairs[r].hguid == h)
+          return g.table.pairs[r];
+      assert(!"no such row");
+      return PilotPair();
+    };
+    std::map<uint32_t, size_t> looked;
+    const auto casts = [&](uint32_t h) { // The effect IDs cast on h by itself since the last look.
+      std::string ids;
+      for (size_t &k = looked[h]; k < g.casts.size(); ++k)
+        if (g.casts[k].la == g.by_guid[h] && g.casts[k].caster == g.casts[k].la)
+          ids += std::to_string(g.casts[k].id) + " ";
+      return ids;
+    };
+    const auto turn = [&](const std::string &line = std::string()) {
+      if (!line.empty())
+        g.inbox.push_back(msg(line));
+      frame(g, *e, t += 16);
+      return lines(g);
+    };
+    const std::string freeze = std::to_string(kBlockAi) + " " + std::to_string(kSkillCancel) + " ",
+                      thaw = std::to_string(kDispel) + " ";
+    g.state(101, 7, 1);
+    turn();
+    assert(has(turn("SBF11 exec 1 101 1"), "SBF11 own 1 101 G 1\n") && casts(101) == freeze);
+    assert(row(101).owner == coop::pilot::kGuest && (row(101).bits & kRowDrawn) && (row(101).bits & kRowRelease));
+    assert(e->host.executing(101, t) && count(g, "exec", "her takedown begins") == 1 && e->counts.owns == 1);
+    turn("SBF11 hit 1 1 101 1600 0 0 1600 1");
+    assert(g.hp(101) == 1 && !g.dying(101) && count(g, "kill held", "her takedown") == 1);
+    for (int i = 0; i < 30; ++i)
+      assert(!has(turn(), "dead"));
+    assert(has(turn("SBF11 exec 1 101 0"), "SBF11 dead 1 101\n") && casts(101) == thaw);
+    assert(g.body(101).deaths == 1 && g.body(101).killer == g.eve && e->host.counts.expired == 0);
+    // 102.
+    g.state(102, 7, 1);
+    turn();
+    assert(has(turn("SBF11 exec 1 102 1"), "SBF11 own 1 102 G 1\n"));
+    const uint64_t taken = t;
+    g.hit(102, kShield, 5);
+    turn();
+    turn("SBF11 exec 1 102 0");
+    g.state(102, 7, 0);
+    while (t < taken + 6000)
+      assert(!has(turn(), "own"));
+    assert(row(102).owner == coop::pilot::kGuest);
+    // 103.
+    g.state(103, 7, 1);
+    turn();
+    assert(has(turn("SBF11 exec 1 103 1"), "SBF11 own 1 103 G 1\n"));
+    const uint64_t first = t;
+    turn("SBF11 exec 1 103 0");
+    while (t < first + 500)
+      turn();
+    casts(103);
+    g.knock(103, 5000039);
+    assert(has(turn(), "SBF11 own 1 103 H 2\n") && casts(103) == thaw && row(103).owner == coop::pilot::kHost);
+    coop::pilot::Owned o[kMaxPairs];
+    const auto flags = [&](uint32_t h) {
+      const size_t n = owned(g.table, o);
+      for (size_t k = 0; k < n; ++k)
+        if (o[k].hguid == h)
+          return int(o[k].flags);
+      return -1;
+    };
+    assert(flags(103) == coop::pilot::kExec && (row(103).bits & kRowExec));
+    g.end(103, 5000039);
+    turn();
+    assert(flags(103) == 0);
+    while (t < first + 2100)
+      assert(!has(turn(), "own")); // The host's takedown was its last hit.
+    const uint64_t asked = t + 16;
+    assert(has(turn("SBF11 exec 1 103 1"), "SBF11 own 1 103 G 3\n"));
+    turn("SBF11 hit 1 2 103 1600 0 0 1600 1");
+    assert(g.hp(103) == 1);
+    while (t + 16 < asked + kHoldMs)
+      assert(!has(turn(), "dead"));
+    assert(has(turn(), "SBF11 dead 1 103\n") && e->host.counts.expired == 1 && count(g, "held-expired") == 1);
+    // 102 again, its Groggy over, and the boss, its balance emptied by her claim in that turn: refused.
+    assert(!has(turn("SBF11 exec 1 102 1"), "own") && !e->host.executing(102, t));
+    g.inbox.push_back(msg("SBF11 hit 1 3 104 0 0 200 1600 0"));
+    assert(!has(turn("SBF11 exec 1 104 1"), "own") && !e->host.executing(104, t));
+    assert(e->host.counts.exec_refused == 2 && count(g, "exec refused", "no Groggy or takedown on our copy") == 2);
+    // 105, a Monster with no Groggy: her claim emptying its balance and her exec 1 in one turn hand it to her.
+    g.inbox.push_back(msg("SBF11 hit 1 4 105 0 0 200 1600 0"));
+    assert(has(turn("SBF11 exec 1 105 1"), "SBF11 own 1 105 G 1\n") && e->host.executing(105, t));
+    assert(e->host.counts.execs == 5 && e->host.counts.bad == 0 && !e->latched());
+    // 106, groggy under NoDamageNoHit, which our freeze waits out: her takedown hands it to her only once that ends, so
+    // its AI never runs in both games.
+    g.state(106, 7, 1);
+    g.state(106, kNoDamageNoHit, 1);
+    turn();
+    assert(!has(turn("SBF11 exec 1 106 1"), "own") && e->host.executing(106, t));
+    assert(!has(turn(), "own") && casts(106).empty());
+    g.state(106, kNoDamageNoHit, 0);
+    assert(has(turn(), "SBF11 own 1 106 G 1\n") && casts(106) == freeze && e->host.counts.execs == 6);
+  }
+  // Her side. A takedown marker on her copy, while same-place enemies run here with aggro=game: exec 1 in that turn,
+  // exec 0 once it has held none for 200 ms (a turn between the two markers ends nothing), or in the turn same place
+  // stops here; none with the host's aggro=host. The host's own G for that pair is hers even while her copy holds
+  // NoDamageNoHit (her takedown may). A pair that leaves her list mid-takedown ends it with exec 0.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    g.spawn(502, 5002, 0);
+    for (const char *line :
+         {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600", "SBF11 up 1 102 5002 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    frame(g, *e, t);
+    frame(g, *e, t += 16);
+    lines(g);
+    const auto turn = [&](const std::string &line = std::string()) {
+      if (!line.empty())
+        g.inbox.push_back(msg(line));
+      frame(g, *e, t += 16);
+      return lines(g);
+    };
+    g.state(501, 7, 1);
+    g.knock(501, 5000039);
+    g.state(501, kNoDamageNoHit, 1);
+    assert(turn() == "SBF11 exec 1 101 1\n" && count(g, "exec", "our takedown begins") == 1);
+    assert(turn("SBF11 own 1 101 G 1").empty() && g.table.pairs[0].owner == coop::pilot::kGuest);
+    assert(turn().empty());
+    g.end(501, 5000039);
+    assert(turn().empty());
+    g.knock(501, 2006004);
+    assert(turn().empty());
+    g.end(501, 2006004);
+    const uint64_t last = t; // Its last marked turn.
+    while (t + 16 < last + coop::pilot::kExecCalmMs)
+      assert(turn().empty());
+    assert(turn() == "SBF11 exec 1 101 0\n" && count(g, "exec", "our takedown ends") == 1);
+    g.knock(502, 2006004);
+    assert(turn("SBF11 aggro 1 host").empty());
+    assert(turn("SBF11 aggro 1 game") == "SBF11 exec 1 102 1\n");
+    const uint64_t told = t;
+    e->pilot_off(true);
+    assert(turn() == "SBF11 own-no 1 101 1 off\nSBF11 exec 1 102 0\n");
+    e->pilot_off(false);
+    for (int k = 0; t + 16 < told + coop::pilot::kExecSpaceMs; ++k) { // Marked all along: told again 2.25 s after.
+      if (k % 40 == 0)
+        g.knock(502, 2006004);
+      assert(turn().empty());
+    }
+    assert(turn() == "SBF11 exec 1 102 1\n");
+    g.unlink(502); // Gone from her map: unpaired, so her takedown ends.
+    assert(turn() == "SBF11 exec 1 102 0\n" && e->guest.counts.execs == 3 && e->guest.counts.bad == 0);
+    g.knock(501, 5000039);
+    assert(turn() == "SBF11 exec 1 101 1\n");
+    g.state(501, kNoDamageNoHit, 0);
+    g.hit(501, kHp, 1600); // Her lethal hit kills her copy (guest_kills=at_once): exec 0 in that turn.
+    assert(has(turn(), "SBF11 exec 1 101 0\n") && e->guest.counts.execs == 4);
+  }
+  // Her copy, groggy, is never frozen while it is released, unless her game thread's word says the owner's stream holds
+  // a takedown (kExec): then it is, to play the takedown from the stream (stage 3c), and the word's end leaves it so.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    g.state(501, 7, 1);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    uint64_t t = 0;
+    for (; t < 160; t += 16)
+      frame(g, *e, t);
+    assert(g.casts.empty() && (g.table.pairs[0].bits & kRowDrawn) && (g.table.pairs[0].bits & kRowRelease));
+    g.flags.exec[0] = 101, g.flags.exec_count = 1;
+    frame(g, *e, t += 16); // The word reaches the job at this turn's end,
+    assert(g.casts.empty());
+    frame(g, *e, t += 16); // and its freeze comes at the next.
+    assert(g.casts.size() == 2 && g.casts[0].id == kBlockAi && g.casts[1].id == kSkillCancel);
+    g.flags.exec_count = 0;
+    for (int i = 0; i < 20; ++i)
+      frame(g, *e, t += 16);
+    assert(g.casts.size() == 2 && Game::held(g.body(501), kBlockAiState) && (g.table.pairs[0].bits & kRowFrozen));
+  }
+  // coop fight pilot test exec (T11d-solo's probe of 3c): at the next turn the first copy this side draws and holds
+  // frozen has its balance emptied, a drop with a number and no cause, which her side then claims as her hit. None
+  // drawn and frozen: refused; an empty balance: said so.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->same_place(true);
+    e->set(true, false);
+    g.spawn(501, 5001, 0);
+    for (const char *line : {"SBF11 world 1", "SBF11 place 1 1", "SBF11 up 1 101 5001 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    e->exec_test();
+    frame(g, *e, 0);
+    assert(count(g, "pilot test exec", "refused: no frozen copy drawn") == 1);
+    frame(g, *e, 16);
+    e->exec_test();
+    frame(g, *e, 32);
+    const Game::Call &c = g.calls.back();
+    assert(count(g, "pilot test exec", "balance emptied: take it down") == 1);
+    assert(c.la == g.by_guid[501] && c.type == kStatType[kStamina] && c.delta == -200 && c.notify && !c.cause);
+    lines(g);
+    frame(g, *e, 48);
+    assert(lines(g) == "SBF11 hit 1 1 101 0 0 200 1600 0\n");
+    e->exec_test();
+    frame(g, *e, 64);
+    assert(count(g, "pilot test exec", "its balance is empty already") == 1 && !e->latched());
+  }
+  // ---- Stage 3c, two worlds through channel 2: her takedown holds the host's kill ----
+  // One paired enemy, the host's, both copies groggy from 1.5 s (the shared balance). At 2 s her EVE starts a takedown
+  // on her copy (its marker lasts 60 turns, about 1 s), whose lethal hit at 2.5 s leaves her copy at 1 HP
+  // (guest_kills=confirmed). Her exec 1 hands her the enemy, with 0 AI copies for one hop at most and the host's copy
+  // frozen from then on. The host holds her lethal claim at 1 HP until her exec 0, sent as the marker ends, reaches it,
+  // and kills its copy in that turn; its dead then kills hers. One death in each world, no held-expired.
+  {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(false, false);
+    eh->same_place(true);
+    eg->confirm(true);
+    eg->set(true, false);
+    H.spawn(100, 7000, 0);
+    G.spawn(900, 7000, 0);
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(9);
+    uint64_t exec0 = 0, lethal = 0, dead = 0, bad_since = 0, worst = 0, windows = 0;
+    for (uint64_t t = 0; t <= 6000; t += 16) {
+      for (const auto &[at, text] : to_host.queue) {
+        exec0 = !exec0 && at <= t && text == "SBF11 exec 1 100 0" ? t : exec0;
+        lethal = !lethal && at <= t && has(text, "SBF11 hit 1 ") && has(text, " 100 1599 ") ? t : lethal;
+      }
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      if (t == 1504)
+        H.state(100, 7, 1), G.state(900, 7, 1);
+      if (t == 2000)
+        G.knock(900, 5000039);
+      if (t == 2496)
+        G.hit(900, kHp, 1600);
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      if (!dead && H.body(100).deaths)
+        dead = t;
+      if (t >= 1000 && !dead) {
+        const int ai = !Game::held(H.body(100), kBlockAiState) + !Game::held(G.body(900), kBlockAiState);
+        if (ai != 1 && !bad_since)
+          bad_since = t;
+        if (ai == 1 && bad_since)
+          worst = std::max(worst, t - bad_since), ++windows, bad_since = 0;
+        if (lethal && t > lethal)
+          assert(H.hp(100) == 1); // Held while her takedown runs.
+      }
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+    }
+    std::printf("fight_engine_test: stage 3c two worlds: her lethal claim in at %llu ms, exec 0 at %llu ms, the host's "
+                "kill at %llu ms; 0 AI copies for %llu ms\n",
+                static_cast<unsigned long long>(lethal), static_cast<unsigned long long>(exec0),
+                static_cast<unsigned long long>(dead), static_cast<unsigned long long>(worst));
+    assert(lethal && exec0 > lethal + 300 && dead == exec0 && windows == 1 && worst <= 150 + 16);
+    assert(eh->counts.owns == 1 && eg->counts.owns == 1 && eh->host.counts.execs == 1 && eg->guest.counts.execs == 1);
+    assert(eh->host.counts.held == 1 && eh->host.counts.expired == 0 && eh->host.counts.kills == 1);
+    assert(H.body(100).deaths == 1 && G.body(900).deaths == 1 && eg->guest.counts.kills == 1);
+    assert(eh->host.counts.bad == 0 && eg->guest.counts.bad == 0 && !eh->latched() && !eg->latched());
+  }
+
+  // ---- Same spawns (stage 4), two worlds through channel 2: 90-150 ms each way, in order ----
+  // The host's zone (alias 0xA1 in its process, 0xB7 in hers: one ZoneTable ID, 40) holds keys 1-8; hers holds 5-12 and
+  // four keys that stay out (a save row, a keep row, an event row and another zone's). The EVEs stand 200 m apart, then
+  // 20 m from 5 s. With same_spawns off nothing of stage 4 happens: no line, no row read, no call. With it on nothing
+  // happens either while they stand 200 m apart; then her set becomes the host's: 1-4 created where the host's stand
+  // (they pair through stage 1), 9-12 despawned, her four left; nothing ever dies in either world. The host's zone then
+  // resets (its spawn manager 3, 1, 3: epoch 2), and a spawn line of epoch 1 that comes after is dropped; her rounds of
+  // epoch 2 are answered with nothing to change. A drop line of epoch 2 for key 5, which stage 1 pairs on her side, is
+  // stale: the host's dead ends that enemy, never a despawn.
+  for (const bool on : {false, true}) {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_spawns(on);
+    eg->same_spawns(true); // Hers decides nothing: only the host's epoch line starts her side.
+    for (Game *w : {&H, &G}) {
+      w->spawns();
+      w->zone(w == &H ? 0xA1 : 0xB7, 40);
+      w->zone(w == &H ? 0xA2 : 0xB8, 41);
+      w->enter(w == &H ? 0xA1 : 0xB7);
+      const uint64_t here = w == &H ? 0xA1 : 0xB7, there = w == &H ? 0xA2 : 0xB8;
+      for (uint32_t id = 1; id <= 12; ++id)
+        w->spawn_row(id, 2, here);
+      w->spawn_row(20, 1, here), w->spawn_row(21, 2, here, 0, true), w->spawn_row(22, 2, here, 1);
+      w->spawn_row(23, 2, there), w->spawn_row(13, 2, here), w->spawn_row(24, 3, here);
+      w->place(1, 0, w == &H ? 0.f : 2000.f);
+      w->flags.her_ok = true;
+      w->flags.her[1] = w == &H ? 20000.f : -18000.f; // The other EVE's ghost, 200 m away.
+    }
+    for (uint32_t id = 1; id <= 8; ++id) {
+      H.spawn(100 + id, id, 0);
+      H.place(100 + id, 300.f * float(id), 500, -45.f);
+    }
+    H.spawn(130, 13, 0, 50330, 100000); // A Monster the shared fight does not share (not in fight_chars): never sent.
+    H.place(130, 900, 500);
+    H.spawn(124, 24, 0); // A SaveWithTransform row's Monster she lacks: per-player content, never sent.
+    H.place(124, 1200, 500);
+    for (uint32_t id = 5; id <= 12; ++id)
+      G.spawn(900 + id, id, 0);
+    for (uint32_t id = 20; id <= 23; ++id)
+      G.spawn(900 + id, id, 0);
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(11);
+    bool spawn_lines = false;
+    uint64_t same_at = 0, stale_before = 0;
+    std::vector<std::pair<uint32_t, uint8_t>> want;
+    for (uint32_t id = 1; id <= 8; ++id)
+      want.emplace_back(id, 0);
+    for (uint32_t id = 20; id <= 23; ++id)
+      want.emplace_back(id, 0);
+    for (uint64_t t = 0; t <= 20000; t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      if (t == 5008) // 20 m apart.
+        H.flags.her[1] = 2000, G.flags.her[1] = 0;
+      if (t == 10000)
+        H.mem.put<uint32_t>(H.spawn_manager + kSpawnState, 1); // The host's zone resets.
+      if (t == 10240)
+        H.mem.put<uint32_t>(H.spawn_manager + kSpawnState, 3);
+      if (t == 12000 && on) // A spawn line of epoch 1 that comes after epoch 2: dropped.
+        G.inbox.push_back(msg("SBF11 spawn " + std::to_string(eg->guest.gen()) + " 1 9 0 900 0 0 0 0"));
+      if (t == 15008 && on) { // Paired on her side: stale.
+        assert(eg->guest.linked() == 8 && eg->snapshot().epoch == 2);
+        stale_before = eg->snapshot().spawns.stale;
+        G.inbox.push_back(msg("SBF11 drop " + std::to_string(eg->guest.gen()) + " 2 5 0"));
+      }
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      for (Game *w : {&H, &G})
+        for (const Message &m : w->sent)
+          spawn_lines = spawn_lines || m.type == Type::epoch || m.type == Type::have || m.type == Type::spawn ||
+                        m.type == Type::drop;
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+      if (!same_at && G.keys() == want)
+        same_at = t;
+      assert(t >= 5008 || (G.made.empty() && G.despawned.empty()));
+    }
+    for (Game *w : {&H, &G}) // Nothing died in either world: despawned, never killed.
+      for (const auto &[la, b] : w->bodies)
+        assert(b.deaths == 0);
+    const Snapshot sh = eh->snapshot(), sg = eg->snapshot();
+    assert(!eh->latched() && !eg->latched() && eh->host.counts.bad == 0 && eg->guest.counts.bad == 0);
+    if (!on) {
+      assert(!spawn_lines && G.made.empty() && G.despawned.empty() && H.lookups == 0 && G.lookups == 0);
+      assert(!sh.spawning && !sg.spawning && sh.epoch == 0 && sg.epoch == 0 && !same_at);
+      continue;
+    }
+    std::printf("fight_engine_test: same spawns, two worlds: her set the host's at %llu ms; %llu rounds answered, %llu "
+                "spawned, %llu despawned; epoch %u; %llu stale on her side\n",
+                static_cast<unsigned long long>(same_at), static_cast<unsigned long long>(sh.spawns.answered),
+                static_cast<unsigned long long>(sg.spawns.spawned),
+                static_cast<unsigned long long>(sg.spawns.despawned),
+                sh.epoch, static_cast<unsigned long long>(sg.spawns.stale));
+    assert(same_at > 5008 && same_at < 10000 && G.keys() == want);
+    assert(G.made.size() == 4 && G.despawned.size() == 4 && sg.spawns.spawned == 4 && sg.spawns.despawned == 4);
+    for (const Game::Made &m : G.made) // Where the host's stand, at its yaw.
+      assert(m.id >= 1 && m.id <= 4 && m.at[0] == 300.f * float(m.id) && m.at[1] == 500 && m.rot[1] == 315);
+    for (uint32_t guid : G.despawned)
+      assert(guid >= 909 && guid <= 912);
+    assert(sh.spawning && sg.spawning && sh.epoch == 2 && sg.epoch == 2 && sg.spawns.stale >= 1 && G.made.size() == 4);
+    assert(sg.spawns.stale > stale_before && stale_before >= 1 && count(G, "drop refused") == 0);
+    assert(sh.spawns.answered >= 2 && sh.spawns.stale >= 1); // Answered at epoch 2 too; her round of epoch 1 dropped.
+    assert(eg->guest.linked() == 8); // The created four paired through stage 1.
+    assert(count(G, "spawned") == 4 && count(G, "despawned") == 4 && count(H, "spawns epoch", "reset") == 1);
+    assert(count(H, "spawn sent") == 4 && count(G, "spawn refused") == 0); // Never key 13's.
+    assert(count(G, "spawns leave", "save-row") == 1 && count(G, "spawns leave", "keep-row") == 1); // Once each.
+    assert(count(G, "spawns leave") == 2 && count(H, "spawns leave", "save-row") == 1 && count(H, "spawns leave") == 1);
+    assert(std::none_of(G.made.begin(), G.made.end(), [](const Game::Made &m) { return m.id == 24; }));
+  }
+
+  // ---- Extra enemies (stage 4b), two worlds through channel 2 with enemy_extra=2 ----
+  // Both games hold keys 1-4 in zone 40, the EVEs 20 m apart. Each of the host's four gets two extras through
+  // NewActor, 2 and 3 m from it; same spawns send them, she makes the same keys (NewActor too, the host's charId,
+  // where the host's stand), and stage 1 pairs all twelve. At 12 s one of the host's extras stands 130 m from both
+  // EVEs: the host despawns it, then her copy goes by a drop. The host's shared enemies off then despawn every extra
+  // still fighting in its game, and its off line every one in hers. Nothing ever dies.
+  {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_spawns(true), eh->enemy_extra(2);
+    eg->enemy_extra(3); // Hers decides nothing.
+    for (Game *w : {&H, &G}) {
+      w->spawns();
+      w->zone(w == &H ? 0xA1 : 0xB7, 40);
+      w->enter(w == &H ? 0xA1 : 0xB7);
+      for (uint32_t id = 1; id <= 4; ++id) {
+        w->spawn_row(id, 2, w == &H ? 0xA1 : 0xB7);
+        w->spawn(100 + id, id, 0);
+        w->place(100 + id, 300.f * float(id), 500, 30);
+      }
+      w->place(1, 0, w == &H ? 0.f : 2000.f);
+      w->flags.her_ok = true;
+      w->flags.her[1] = w == &H ? 2000.f : 0.f; // The other EVE's ghost, 20 m away.
+    }
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(15);
+    size_t most = 0;
+    uint32_t far_copy = 0;
+    for (uint64_t t = 0; t <= 22000; t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      if (t == 12000) { // One of the host's extras walks off, 130 m from both EVEs.
+        H.place(H.extras[0].guid, 13000, -2000);
+        for (const Game::Made &x : G.extras)
+          far_copy = x.id == H.extras[0].id && x.index == H.extras[0].index ? x.guid : far_copy;
+      }
+      if (t == 20000) // The host's worker sends its off line.
+        eh->set(false, true), to_guest.queue.emplace_back(t + 120, "SBF11 off coop fight off");
+      if (t == 21504) { // Her extras went with the host's same spawns; her own end finds none left.
+        assert(count(G, "extra despawned", "end") == 7 && G.despawned.size() == 8);
+        eg->set(false, false);
+      }
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+      most = std::max(most, eg->guest.linked());
+    }
+    std::printf("fight_engine_test: extra enemies, two worlds: %zu made by the host, %zu by her, %zu paired at most\n",
+                H.extras.size(), G.extras.size(), most);
+    assert(!eh->latched() && !eg->latched() && H.extras.size() == 8 && G.extras.size() == 8 && most == 12);
+    for (const Game::Made &x : H.extras) { // n is the enemy's turn in the census: keys 1-4 in order.
+      const uint32_t n = x.id >> 8 & 0xff;
+      assert((x.id & 0xffff00ff) == (kExtraBase | x.index) && n >= 1 && n <= 4 && x.index <= 2);
+      assert(std::fabs(std::hypot(x.at[0] - 300.f * float(n), x.at[1] - 500) - 100.f * float(x.index + 1)) < 0.1f);
+      assert(x.rot[1] == 30 && H.mem.get<uint32_t>(H.by_guid[x.guid] + kCharId) == kChar);
+    }
+    for (const Game::Made &x : G.extras) { // Her copies: the host's keys, where the host's stood (whole cm).
+      const auto at = std::find_if(H.extras.begin(), H.extras.end(),
+                                   [&](const Game::Made &h) { return h.id == x.id && h.index == x.index; });
+      assert(at != H.extras.end() && std::fabs(x.at[0] - at->at[0]) <= 0.5f && std::fabs(x.at[1] - at->at[1]) <= 0.5f);
+      assert(G.mem.get<uint32_t>(G.by_guid[x.guid] + kCharId) == kChar);
+    }
+    assert(count(H, "extra made") == 8 && count(G, "extra made") == 8 && count(G, "spawned") == 8);
+    assert(count(H, "extra despawned", "far") == 1 && far_copy &&
+           std::count(G.despawned.begin(), G.despawned.end(), far_copy) == 1);
+    assert(count(H, "extra despawned", "end") == 7 && count(G, "extra despawned", "end") == 7);
+    assert(H.despawned.size() == 8 && G.despawned.size() == 8 && G.made.empty()); // Never SB's spawn of a key.
+    for (Game *w : {&H, &G})
+      for (const auto &[la, b] : w->bodies)
+        assert(b.deaths == 0);
+  }
+
+  // ---- Extra enemies on the host's side: which enemies get them, the key range check, 120 m, NewActor refusing,
+  // the session's end ----
+  // Only the Monster of the shared charId and a SpawnType 0 row gets three; never a boss or an Elite (BossMonster), an
+  // NPC, a ZoneEvent or Quest spawn, or a charId the shared fight does not share. 125 m from our EVE but 105 m from
+  // her ghost, an extra stays; 145 m and 125 m, it goes. When her shared enemies stop (her off line, the host's still
+  // on), a dying extra is left to its death; the other one goes. When this build's tables hold a row at the extras'
+  // first key, extras stay off for the session (logged once); when NewActor makes nothing, or the reg's global is null
+  // (NewActor's actor setup would make one through its getter), the refusal is logged and nothing is kept. An extra
+  // whose GUID cannot be read latches the side and is logged as kept, since no capture takes it off. A new session of
+  // the host's gives the same enemy three more under the next n, so no key comes back while an old extra dies.
+  for (const int run : {0, 1, 2, 3, 4}) { // 0: extras; 1: the key range taken; 2: NewActor refuses; 3: a GUID unread;
+                                          // 4: no reg.
+    Game H;
+    auto eh = engine(true, true);
+    eh->same_spawns(true), eh->enemy_extra(3);
+    H.spawns(), H.zone(0xA1, 40), H.enter(0xA1);
+    if (run == 4)
+      H.mem.put<uint64_t>(rebased(coop::nightop::kGlobals) + kPauseAt, 0);
+    for (uint32_t id = 1; id <= 6; ++id)
+      H.spawn_row(id, 2, 0xA1, id == 4 ? 1 : id == 5 ? 2 : 0);
+    if (run == 1)
+      H.spawn_row(0xE0000101, 2, 0xA1);
+    H.refuse_make = run == 2, H.unread_make = run == 3;
+    H.spawn(101, 1, 0);
+    H.spawn(102, 2, 0, kChar, 1600, 4);     // A boss or an Elite.
+    H.spawn(103, 3, 0, kChar, 1600, 2);     // An NPC.
+    H.spawn(104, 4, 0), H.spawn(105, 5, 0); // A ZoneEvent spawn, a Quest one.
+    H.spawn(106, 6, 0, 50330, 100000);      // A charId the shared fight does not share.
+    H.flags.her_ok = true;
+    H.flags.her[0] = 2000; // Her ghost, 20 m away.
+    H.inbox.push_back(msg("SBF11 on"));
+    uint64_t t = 0;
+    const auto run_to = [&](uint64_t end) {
+      for (; t <= end; t += 16)
+        frame(H, *eh, t);
+    };
+    run_to(2900); // Our zone not settled yet (3 s): none.
+    assert(H.extras.empty() && count(H, "extra refused") == 0);
+    H.flags.her[0] = 20000; // Her ghost 200 m away: the zone is not shared, none.
+    run_to(4500);
+    assert(H.extras.empty() && count(H, "extra refused") == 0);
+    H.flags.her[0] = 2000;
+    run_to(6000);
+    if (run == 3) {
+      assert(eh->latched() && std::string(eh->why()) == "unreadable" && count(H, "extra kept", "guid unread") == 1);
+      continue;
+    }
+    assert(!eh->latched() && H.despawned.empty());
+    if (run == 1) {
+      assert(H.extras.empty() && count(H, "extras off", "key range taken") == 1 && count(H, "extra refused") == 0);
+      continue;
+    }
+    if (run == 2 || run == 4) {
+      assert(H.extras.empty() && count(H, "extra refused", "not made") == 3 && count(H, "extra made") == 0);
+      run_to(8000);
+      assert(count(H, "extra refused") == 3); // Once a life.
+      continue;
+    }
+    assert(H.extras.size() == 3 && count(H, "extra made") == 3 && count(H, "extras off") == 0);
+    for (const Game::Made &x : H.extras)
+      assert(x.id == (kExtraBase | 1 << 8 | x.index)); // Key 1's.
+    const uint32_t a = H.extras[0].guid, b = H.extras[1].guid, c = H.extras[2].guid;
+    H.place(a, 12500, 0);
+    run_to(7000);
+    assert(H.despawned.empty());
+    H.place(a, 14500, 0);
+    run_to(8000);
+    assert(count(H, "extra despawned", "far") == 1 && H.despawned == std::vector<uint32_t>{a});
+    H.mem.put<uint8_t>(H.by_guid[b] + kPendingDeath, 1);
+    H.inbox.push_back(msg("SBF11 off coop fight off"));
+    run_to(9000);
+    assert(eh->on() && !eh->snapshot().spawning);
+    assert(count(H, "extra despawned", "end") == 1 && (H.despawned == std::vector<uint32_t>{a, c}));
+    assert(H.extras.size() == 3 && eh->snapshot().spawns.extras == 3 && eh->snapshot().spawns.extras_gone == 2);
+    eh->set(false, true), eh->set(true, true); // b still dying under key 1's first extra key.
+    H.inbox.push_back(msg("SBF11 on"));
+    run_to(14000);
+    assert(H.extras.size() == 6 && !eh->latched());
+    for (size_t i = 3; i < 6; ++i)
+      assert(H.extras[i].id == (kExtraBase | 2 << 8 | H.extras[i].index));
+  }
+
+  // ---- Same spawns: a Save row the host meets is logged once a session, also once the row room is full ----
+  // Her rounds name 720 keys with no row in the host's tables, then twice 720 keys of Save rows there (both kinds are
+  // kept as they are): the keys with no row take no room, the first kMaxRows Save rows are kept and logged once, and
+  // the rest are looked up again each time but never logged.
+  {
+    Game H;
+    auto eh = engine(true, true);
+    eh->same_spawns(true);
+    H.spawns();
+    H.zone(0xA1, 40);
+    H.enter(0xA1);
+    for (uint32_t id = 1000; id < 1000 + 3 * kMaxKeys; ++id)
+      H.spawn_row(id, 1, 0xA1);
+    H.flags.her_ok = true;
+    H.inbox.push_back(msg("SBF11 on"));
+    uint32_t next = 5000, rounds = 0; // Keys with no row first.
+    for (uint64_t t = 0, round_at = 4000; t <= 13000; t += 16) {
+      if (t >= round_at && rounds < 9) { // One round of kMaxKeys keys a second, from 4 s.
+        round_at += 1000;
+        if (rounds == 3 || rounds == 6) // Then the Save rows, twice.
+          next = 1000;
+        ++rounds;
+        const std::string head = "SBF11 have " + std::to_string(eh->host.gen()) + " 1 ";
+        for (size_t part = 1; part <= kHaveParts; ++part) {
+          std::string line = head + std::to_string(part) + " " + std::to_string(kHaveParts);
+          for (size_t k = 0; k < kHaveKeys; ++k)
+            line += " " + std::to_string(next++) + ":0";
+          H.inbox.push_back(msg(line));
+        }
+      }
+      frame(H, *eh, t);
+      H.sent.clear();
+    }
+    const Snapshot sh = eh->snapshot();
+    assert(sh.epoch == 1 && sh.spawns.answered == 9 && sh.spawns.drop_lines == 0 && !eh->latched());
+    assert(count(H, "spawns leave", "save-row") == kMaxRows && count(H, "spawns leave") == kMaxRows);
+  }
+
+  // ---- Same spawns stop after the pilot's latch: where the other EVE stands is no longer told ----
+  {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_spawns(true);
+    for (Game *w : {&H, &G}) {
+      w->spawns();
+      w->zone(0xA1, 40);
+      w->enter(0xA1);
+      for (uint32_t id = 1; id <= 4; ++id)
+        w->spawn_row(id, 2, 0xA1);
+      w->flags.her_ok = true;
+    }
+    H.spawn(101, 1, 0), H.spawn(102, 2, 0);
+    G.spawn(903, 3, 0), G.spawn(904, 4, 0);
+    eg->stop_pilot();
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(13);
+    for (uint64_t t = 0; t <= 8000; t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+    }
+    assert(G.made.empty() && G.despawned.empty() && eg->snapshot().spawns.haves == 0 && eg->snapshot().epoch == 1);
+  }
+
+  // ---- Same spawns stop while a census's list of keys is partial ----
+  // Past kMaxSeen keyed actors (here NPCs), a key missing from the list would read as one this game lacks: nothing is
+  // sent, created or removed until the list is whole again.
+  {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_spawns(true);
+    for (Game *w : {&H, &G}) {
+      w->spawns();
+      w->zone(0xA1, 40);
+      w->enter(0xA1);
+      for (uint32_t id = 1; id <= 4; ++id)
+        w->spawn_row(id, 2, 0xA1);
+      w->flags.her_ok = true;
+    }
+    H.spawn(101, 1, 0), H.spawn(102, 2, 0);
+    G.spawn(903, 3, 0), G.spawn(904, 4, 0);
+    for (uint32_t i = 0; i < kMaxSeen; ++i)
+      G.spawn(2000 + i, 9000 + i, 0, 70000, 100, 2); // NPCs with keys of their own.
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(12);
+    for (uint64_t t = 0; t <= 8000; t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+    }
+    assert(G.made.empty() && G.despawned.empty() && eg->snapshot().spawns.haves == 0 && eg->counts.cut > 0);
+    assert(eh->snapshot().spawns.answered == 0 && eg->snapshot().epoch == 1 && !eh->latched() && !eg->latched());
+  }
+
+  // ---- coop fight spawn probe (fight probe spawns): same spawns' reads alone, on one game ----
+  // At each probe census: our epoch as same spawns count it, and once an epoch, for each Monster the shared fight
+  // shares, how its spawn row stands in our zone: takes part, save-row, keep-row, another zone, event-row or no row.
+  // Never an NPC's or a Monster fight_chars leaves out; nothing sent, nothing created or despawned. Our zone's reset (a
+  // camp rest: the spawn manager 2, then 4) moves the epoch, and each key is told again. Without spawns no row is read.
+  for (const bool spawns : {false, true}) {
+    Game G;
+    auto e = engine(false, false);
+    e->same_spawns(spawns);
+    e->set(true, false, true);
+    G.spawns();
+    G.zone(0xA1, 40), G.zone(0xA2, 41);
+    G.enter(0xA1);
+    G.spawn_row(1, 2, 0xA1), G.spawn_row(2, 1, 0xA1), G.spawn_row(3, 2, 0xA1, 0, true), G.spawn_row(4, 4, 0xA2);
+    G.spawn_row(5, 0, 0xA1, 1), G.spawn_row(7, 2, 0xA1), G.spawn_row(8, 2, 0xA1);
+    for (uint32_t id = 1; id <= 6; ++id)
+      G.spawn(100 + id, id, 0);
+    G.spawn(107, 7, 0, 70000, 100, 2); // An NPC.
+    G.spawn(108, 8, 0, 50330, 100000); // A Monster fight_chars leaves out.
+    for (uint64_t t = 0; t <= 6000; t += 16) {
+      if (t == 3008)
+        G.mem.put<uint32_t>(G.spawn_manager + kSpawnState, 2);
+      if (t == 4000)
+        G.mem.put<uint32_t>(G.spawn_manager + kSpawnState, 4);
+      frame(G, *e, t);
+    }
+    for (const Message &m : G.sent)
+      assert(m.type != Type::epoch && m.type != Type::have && m.type != Type::spawn && m.type != Type::drop);
+    assert(G.made.empty() && G.despawned.empty() && !e->latched());
+    if (!spawns) {
+      assert(G.lookups == 0 && std::none_of(G.events.begin(), G.events.end(), [](const Event &ev) {
+               return std::string(ev.what).rfind("spawns", 0) == 0;
+             }));
+      continue;
+    }
+    assert(count(G, "spawns epoch", "zone") == 1 && count(G, "spawns epoch", "reset") == 1);
+    const char *const told[] = {"takes part", "save-row", "keep-row", "another zone", "event-row", "no row"};
+    for (uint32_t id = 1; id <= 6; ++id)
+      assert(std::count_if(G.events.begin(), G.events.end(), [&](const Event &ev) {
+               return std::string(ev.what) == "spawns probe" && ev.spawn == id && ev.why == std::string(told[id - 1]);
+             }) == 2);
+    assert(count(G, "spawns probe") == 12 && e->snapshot().spawning);
+  }
+  // A crowded zone: at most kProbeTold verdicts a census, so the events of one hand-over (kMail) never overflow; the
+  // rest come at the next censuses.
+  {
+    Game G;
+    auto e = engine(false, false);
+    e->same_spawns(true);
+    e->set(true, false, true);
+    G.spawns();
+    G.zone(0xA1, 40);
+    G.enter(0xA1);
+    for (uint32_t id = 1; id <= 40; ++id)
+      G.spawn_row(id, 2, 0xA1), G.spawn(100 + id, id, 0);
+    size_t first = 0;
+    for (uint64_t t = 0; t <= 2000; t += 16) {
+      frame(G, *e, t);
+      if (!first)
+        first = count(G, "spawns probe");
+    }
+    assert(first == kProbeTold && count(G, "spawns probe", "takes part") == 40 && !e->latched());
+  }
+
+  // ---- Same spawns' two game calls on fake memory: their arguments; none with no spawn manager or after a latch ----
+  // The host holds keys 1 and 5:2 (where it stands, at its yaw), she holds 3 and 4. FUN_141c1c9a0 gets SB's spawn
+  // manager as the global holds it, the key's EventSpawnId and SpawnIndex, where and (0, yaw, 0); FUN_141b077f0 the job
+  // sender as its global holds it, this logic turn and the actor's GUID (the fakes check both on the logic thread,
+  // inside the job). With the spawn manager's global still null her game refuses each spawn and calls nothing (the
+  // drops go on: they need the job sender only). With the job sender's global null she calls neither: the spawn of a
+  // row with EventOnSpawning events would make SB's getter allocate one. With the reg's global null she spawns nothing
+  // (the spawn's NewActor would make one) and the drops go on. An unreadable spawn row latches her side: no
+  // call after it (the spawn before it went), and her side stops sending. While she fights 903 (BattleMode) and takes
+  // 904 down (a takedown marker), neither is despawned (busy, no difference between the games); once she is done,
+  // the host's next answer despawns both.
+  for (const int run : {0, 1, 2, 3, 4, 5}) { // 0: both calls; 1: no spawn manager; 2: an unreadable row; 3: no job
+                                             // sender; 4: her enemies busy until 5 s; 5: no reg.
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->same_spawns(true);
+    for (Game *w : {&H, &G}) {
+      w->spawns();
+      w->zone(0xA1, 40);
+      w->enter(0xA1);
+      for (uint32_t id = 1; id <= 5; ++id)
+        w->spawn_row(id, 2, 0xA1);
+      w->flags.her_ok = true;
+    }
+    H.spawn(101, 1, 0), H.spawn(105, 5, 2);
+    H.place(101, 100, 200, 30), H.place(105, 700, 800, 90);
+    G.spawn(903, 3, 0), G.spawn(904, 4, 0);
+    if (run == 1)
+      G.mem.put<uint64_t>(rebased(kSpawnManager), 0);
+    if (run == 2)
+      G.spawn_rows[5] = 0x7fff00000000; // Plausible, never mapped.
+    if (run == 3)
+      G.mem.put<uint64_t>(rebased(kJobSender), 0);
+    if (run == 5)
+      G.mem.put<uint64_t>(rebased(coop::nightop::kGlobals) + kPauseAt, 0);
+    if (run == 4) {
+      G.state(903, kBattleState, 1);
+      G.knock(904, 5000039), G.body(904).effects.back().left = 1 << 30;
+    }
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(14);
+    G.watch = eg.get();
+    for (uint64_t t = 0; t <= (run == 4 ? 10000u : 8000u); t += 16) {
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      if (run == 4 && t == 5008) {
+        assert(G.despawned.empty() && count(G, "drop refused", "busy") == 2);
+        G.state(903, kBattleState, 0), G.end(904, 5000039);
+      }
+      frame(H, *eh, t);
+      frame(G, *eg, t);
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+    }
+    for (const auto &[la, b] : G.bodies)
+      assert(b.deaths == 0);
+    if (run == 0) {
+      assert(G.made.size() == 2 && G.despawned.size() == 2 && !eg->latched());
+      for (const Game::Made &m : G.made) {
+        const bool five = m.id == 5;
+        assert(m.index == (five ? 2 : 0) && m.at[0] == (five ? 700 : 100) && m.at[1] == (five ? 800 : 200));
+        assert(m.at[2] == 0 && m.rot[0] == 0 && m.rot[1] == (five ? 90 : 30) && m.rot[2] == 0);
+      }
+      assert(std::count(G.despawned.begin(), G.despawned.end(), 903u) == 1 &&
+             std::count(G.despawned.begin(), G.despawned.end(), 904u) == 1);
+    } else if (run == 1 || run == 5) {
+      assert(G.made.empty() && G.despawned.size() == 2 && !eg->latched());
+      assert(count(G, "spawn refused", "no spawn manager") == 2 && eg->snapshot().spawns.differ == 0);
+    } else if (run == 3) {
+      assert(G.made.empty() && G.despawned.empty() && !eg->latched());
+      assert(count(G, "spawn refused", "no spawn manager") == 2 && count(G, "drop refused", "gone") == 2 &&
+             eg->snapshot().spawns.differ == 0);
+    } else if (run == 4) {
+      assert(G.made.size() == 2 && !eg->latched() && count(G, "drop refused") == 2 &&
+             eg->snapshot().spawns.differ == 0);
+      assert(std::count(G.despawned.begin(), G.despawned.end(), 903u) == 1 &&
+             std::count(G.despawned.begin(), G.despawned.end(), 904u) == 1);
+    } else { // Key 1's spawn comes before key 5's row is read; nothing after it, the two drops neither.
+      assert(eg->latched() && std::string(eg->why()) == "unreadable" && G.made.size() == 1 && G.made[0].id == 1);
+      assert(G.despawned.empty());
+      // The rest of that census's step logs and sends nothing: key 5 is no "no row", the drops no "gone".
+      assert(G.after_latch == 0 && count(G, "spawn refused") == 0 && count(G, "drop refused") == 0);
+    }
+  }
+
+  // ---- Two-player scaling (PHASE11-STAGE2-RE 4): on each enemy the side names, MaxHPValue (stat 3, which MaxHP
+  // follows) and MaxStamina (13) up by the host's percents, then HP and Stamina up in proportion, once; back off when
+  // the side lets the enemy go (a dying one keeps its HP) and at off, HP and Stamina then down in proportion ----
+  {
+    Game g;
+    auto e = engine(false, true);
+    e->scale(135, 115);
+    e->set(true, true);
+    g.spawn(101, 5001, 0);
+    g.spawn(102, 5002, 0);
+    g.hit(102, kHp, 800);
+    g.hit(102, kStamina, 100);
+    const auto stat = [&](uint32_t guid, int type) {
+      return int(g.mem.get<float>(g.fsb(guid) + kStatBase + 4 * size_t(type)));
+    };
+    const auto made = [&](size_t from, uint32_t guid, std::vector<std::pair<int, int>> want) {
+      std::vector<std::pair<int, int>> got;
+      for (size_t i = from; i < g.calls.size(); ++i)
+        if (g.calls[i].la == g.by_guid[guid]) {
+          assert((!g.calls[i].cause && !g.calls[i].notify) || g.calls[i].cause == g.eve); // Ours show no number.
+          got.emplace_back(g.calls[i].type, int(g.calls[i].delta));
+        }
+      return got == want;
+    };
+    g.calls.clear();
+    frame(g, *e, 0);
+    assert(g.calls.empty() && stat(101, 2) == 1600); // Her on has not come.
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 16);
+    const std::string first = lines(g); // Their values wait for the next turn, which reads them scaled.
+    assert(has(first, "SBF11 world 1\nSBF11 scale 1 135 115\nSBF11 up 1 101 5001 0 900 1600\n") && !has(first, " hp "));
+    assert(made(0, 101, {{3, 560}, {1, 560}, {13, 30}, {12, 30}}));
+    assert(made(0, 102, {{3, 560}, {1, 280}, {13, 30}, {12, 15}}));
+    assert(stat(101, 3) == 2160 && stat(101, 2) == 2160 && stat(101, 1) == 2160 && stat(101, 13) == 230);
+    assert(stat(102, 1) == 1080 && stat(102, 12) == 115 && e->snapshot().scaled == 2);
+    assert(e->snapshot().scale[kScaleHp] == 135 && e->snapshot().scale[kScaleBalance] == 115);
+    size_t calls = g.calls.size();
+    frame(g, *e, 70); // Held: never twice. Her values are the scaled ones.
+    assert(g.calls.size() == calls && has(lines(g), " 101:2160:100:230 102:1080:100:115\n"));
+    // Her lethal claim kills 102: out of the list, its scaling comes off in the same turn, its HP left at 0.
+    g.inbox.push_back(msg("SBF11 hit 1 1 102 1080 0 0 1080 1"));
+    frame(g, *e, 86);
+    assert(g.body(102).deaths == 1 && g.body(102).killer == g.eve);
+    assert(made(calls, 102, {{1, -1080}, {3, -560}, {13, -30}}) && stat(102, 2) == 1600 && e->snapshot().scaled == 1);
+    // Off: 101, hit to half its HP and Stamina, gets its own maxes back and keeps half of each.
+    g.hit(101, kHp, 1080);
+    g.hit(101, kStamina, 115);
+    frame(g, *e, 102);
+    e->set(false, true);
+    calls = g.calls.size();
+    frame(g, *e, 118);
+    assert(made(calls, 101, {{3, -560}, {1, -280}, {13, -30}, {12, -15}}));
+    assert(stat(101, 3) == 1600 && stat(101, 2) == 1600 && stat(101, 1) == 800 && stat(101, 13) == 200);
+    assert(stat(101, 12) == 100 && e->snapshot().scaled == 0 && g.queue.empty() && !e->latched());
+  }
+  // The guest: the host's percents from its scale line; a copy we hold scaled reads so in the pass (Seen::scaled) and
+  // pairs again only once let go, on its own MaxHP. A MaxHP that is not stat 3 x (1 + stat 4) (something of the
+  // game's changed it) stays as it is, counted. Floors and scaling on one copy: a kill takes the floor off first, even
+  // one with no cause (kill_credit=fought: our EVE never hit it), and the scaling right after.
+  {
+    Game g;
+    auto e = engine(false, false);
+    e->confirm(true);
+    e->credit(false);
+    e->set(true, false);
+    for (uint32_t i = 0; i < 3; ++i)
+      g.spawn(501 + i, 5001 + i, 0);
+    g.mem.put<float>(g.fsb(503) + kStatBase + 4 * size_t(kMaxHpValue), 1500);
+    const auto stat = [&](uint32_t guid, int type) {
+      return int(g.mem.get<float>(g.fsb(guid) + kStatBase + 4 * size_t(type)));
+    };
+    for (const char *line : {"SBF11 world 1", "SBF11 scale 1 150 110", "SBF11 up 1 101 5001 0 900 1600",
+                             "SBF11 up 1 102 5002 0 900 1600", "SBF11 up 1 103 5003 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, 0);
+    Snapshot snap = e->snapshot();
+    assert(e->guest.linked() == 3 && snap.floors == 3 && snap.scaled == 2 && e->counts.unscaled == 1);
+    assert(snap.scale[kScaleHp] == 150 && snap.scale[kScaleBalance] == 110);
+    assert(stat(501, 2) == 2400 && stat(501, 1) == 2400 && stat(501, 13) == 220 && stat(501, 12) == 220);
+    assert(stat(503, 2) == 1600 && stat(503, 1) == 1600 && stat(503, 13) == 220);
+    frame(g, *e, 16);
+    for (size_t i = 0; i < 3; ++i)
+      assert(e->seen()[i].scaled); // 503 for its balance.
+    g.calls.clear();
+    g.inbox.push_back(msg("SBF11 dead 1 101"));
+    frame(g, *e, 32);
+    assert(g.calls.size() == 4 && g.calls[0].type == kFloorStat && g.calls[0].delta == -1);
+    assert(g.calls[1].type == 1 && g.calls[1].delta == -2400 && !g.calls[1].cause);
+    assert(g.calls[2].type == kMaxHpValue && g.calls[2].delta == -800 && g.calls[3].type == kMaxStamina);
+    assert(g.body(501).deaths == 1 && !g.body(501).killer && e->guest.counts.uncredited == 1 && !e->counts.no_eve);
+    snap = e->snapshot();
+    assert(snap.floors == 2 && snap.scaled == 1);
+    // The host's world: every pair dropped, so our floors and scaling come off; the copies pair again at a census, on
+    // their own MaxHP (never "unpaired maxhp"), and are scaled again.
+    for (const char *line : {"SBF11 world 2", "SBF11 scale 2 150 110", "SBF11 up 2 102 5002 0 900 1600"})
+      g.inbox.push_back(msg(line));
+    frame(g, *e, 48);
+    assert(!e->guest.linked() && !e->snapshot().floors && !e->snapshot().scaled && stat(502, 2) == 1600);
+    uint64_t t = 64;
+    for (; t < 64 + 40 * 16 && !e->guest.linked(); t += 16)
+      frame(g, *e, t);
+    assert(e->guest.linked() == 1 && count(g, "unpaired", "maxhp") == 0 && count(g, "paired") == 4);
+    frame(g, *e, t);
+    assert(stat(502, 2) == 2400 && stat(503, 13) == 200 && e->snapshot().scaled == 1 && e->snapshot().floors == 1);
+  }
+  // A stat 3 this build keeps elsewhere: off for the run, and the latch's lift takes the delta back off there.
+  {
+    Game h;
+    auto e = engine(false, true);
+    e->scale(135, 100);
+    e->set(true, true);
+    h.spawn(101, 5001, 0);
+    h.no_scale = h.by_guid[101];
+    h.inbox.push_back(msg("SBF11 on"));
+    frame(h, *e, 0);
+    assert(e->latched() && !strcmp(e->why(), "implausible scale") && e->snapshot().scaled == 0);
+    size_t moved = 0;
+    for (const Game::Call &c : h.calls)
+      moved += c.type == kMaxHpValue;
+    assert(moved == 2 && h.elsewhere == 0 && e->forget() == 0);
+  }
+  // A stat 3 that reads back wrong once MaxHP rose: the latch's lift takes the max back and leaves HP alone, since
+  // the raise in proportion never came.
+  {
+    Game g;
+    auto e = engine(false, true);
+    e->scale(135, 100);
+    e->set(true, true);
+    g.spawn(101, 5001, 0);
+    frame(g, *e, 0);
+    g.calls.clear();
+    g.during = [&] { g.mem.put<float>(g.fsb(101) + kStatBase + 4 * size_t(kMaxHpValue), 1601); }; // Off by one.
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 16);
+    assert(e->latched() && !strcmp(e->why(), "implausible scale") && g.calls.size() == 2);
+    assert(g.calls[0].type == kMaxHpValue && g.calls[0].delta == 560 && g.calls[1].delta == -560);
+    assert(g.mem.get<float>(g.fsb(101) + kStatBase + 4) == 1600 && g.mem.get<float>(g.fsb(101) + kStatBase + 8) == 1601);
   }
 
   // ---- fight_chars=auto: with no list, every Monster (ActorType 3 at FSBActor +0x368), never a boss or an Alpha
@@ -635,10 +3284,10 @@ int main() {
     g.spawn(101, 5001, 0);
     frame(g, *e, 0);
     assert(e->host.linked() == 1 && e->snapshot().hosted == 0);
-    g.inbox.push_back(msg("SBF9 on"));
+    g.inbox.push_back(msg("SBF11 on"));
     frame(g, *e, 16);
     assert(e->snapshot().hosted == 1);
-    g.inbox.push_back(msg("SBF9 off busy"));
+    g.inbox.push_back(msg("SBF11 off busy"));
     frame(g, *e, 32);
     assert(e->host.linked() == 1 && e->snapshot().hosted == 0);
   }
@@ -649,13 +3298,13 @@ int main() {
     auto e = engine(true, true);
     for (uint32_t i = 0; i < 3; ++i)
       g.spawn(101 + i, 5001 + i, 0);
-    g.inbox.push_back(msg("SBF9 on")); // The guest's on: the host's whole list.
+    g.inbox.push_back(msg("SBF11 on")); // The guest's on: the host's whole list.
     frame(g, *e, 0);
-    assert(lines(g) == "SBF9 on\nSBF9 world 1\nSBF9 up 1 101 5001 0 900 1600\nSBF9 up 1 102 5002 0 900 1600\n"
-                       "SBF9 up 1 103 5003 0 900 1600\nSBF9 hp 1 1 0 101:1600:100:200 102:1600:100:200 "
+    assert(lines(g) == "SBF11 on\nSBF11 world 1\nSBF11 up 1 101 5001 0 900 1600\nSBF11 up 1 102 5002 0 900 1600\n"
+                       "SBF11 up 1 103 5003 0 900 1600\nSBF11 hp 1 1 0 101:1600:100:200 102:1600:100:200 "
                        "103:1600:100:200\n");
-    for (const char *hit : {"SBF9 hit 1 1 101 100 0 0 1600 0", "SBF9 hit 1 2 102 100 0 0 1600 0",
-                            "SBF9 hit 1 3 103 100 0 0 1600 0"})
+    for (const char *hit : {"SBF11 hit 1 1 101 100 0 0 1600 0", "SBF11 hit 1 2 102 100 0 0 1600 0",
+                            "SBF11 hit 1 3 103 100 0 0 1600 0"})
       g.inbox.push_back(msg(hit));
     const uint64_t old = g.data;
     g.during = [&] { // The first claim's ApplyStat summons, and the elements move: the old block is gone. The third
@@ -670,7 +3319,28 @@ int main() {
     // The next census walks the moved map: the summon is announced.
     for (uint64_t t = 32; t <= 16 * 16; t += 16)
       frame(g, *e, t);
-    assert(has(lines(g), "SBF9 up 1 150 5050 0 900 1600\n") && !e->latched());
+    assert(has(lines(g), "SBF11 up 1 150 5050 0 900 1600\n") && !e->latched());
+  }
+
+  // ---- Slow motion: counted for the stats line from FSBActor +0x27c4, our EVE's or an enemy's ----
+  {
+    Game g;
+    auto e = engine(true, true);
+    g.spawn(101, 5001, 0);
+    g.inbox.push_back(msg("SBF11 on"));
+    frame(g, *e, 0);
+    g.mem.put(g.fsb(101) + kTimeScale, 0.3f);
+    frame(g, *e, 16);
+    frame(g, *e, 32);
+    g.mem.put(g.fsb(101) + kTimeScale, 1.f);
+    g.mem.put(g.fsb(1) + kTimeScale, 0.5f);
+    frame(g, *e, 48);
+    g.mem.put(g.fsb(1) + kTimeScale, std::nanf("")); // Not a number: 1, and never latched.
+    frame(g, *e, 64);
+    g.mem.put(g.fsb(1) + kTimeScale, 0.5f);
+    frame(g, *e, 80);
+    const JobCounts &c = e->counts;
+    assert(c.slow_turns == 4 && c.slow_starts == 2 && c.slow_min == 30 && !e->latched());
   }
 
   // ---- Pooled reuse: the same object under another GUID ----
@@ -679,8 +3349,8 @@ int main() {
     auto e = engine(true, false);
     const uint64_t la = g.spawn(501, 5001, 0);
     g.spawn(502, 5002, 0); // Ours only: the census sets keep a GUID in common, so the swap is no world change.
-    g.inbox.push_back(msg("SBF9 world 1"));
-    g.inbox.push_back(msg("SBF9 up 1 101 5001 0 900 1600"));
+    g.inbox.push_back(msg("SBF11 world 1"));
+    g.inbox.push_back(msg("SBF11 up 1 101 5001 0 900 1600"));
     frame(g, *e, 0);
     assert(count(g, "paired") == 1);
     // Released and spawned again by the same key: another GUID, and its old element still names the object, which
@@ -694,14 +3364,18 @@ int main() {
     for (; count(g, "paired") < 2 && t < 1000; t += 16)
       frame(g, *e, t);
     assert(count(g, "paired") == 2 && t <= 15 * 16 + 16 && e->counts.rejected == 1); // At the census.
-    g.inbox.push_back(msg("SBF9 hp 1 1 0 101:1000:100:200"));
+    // The re-paired copy's first correction catches up without a damage number; the bar moves.
+    g.inbox.push_back(msg("SBF11 hp 1 1 0 101:1000:100:200"));
     frame(g, *e, t);
     assert(g.calls.size() == 1 && g.calls[0].la == la && g.calls[0].type == 1 && g.calls[0].delta == -600 &&
-           !g.calls[0].cause && g.calls[0].notify && g.calls[0].ignore && g.hp(511) == 1000);
-    // A rise to the host's value shows no damage number (guest rule 2).
-    g.inbox.push_back(msg("SBF9 hp 1 2 0 101:1200:100:200"));
+           !g.calls[0].cause && !g.calls[0].notify && g.calls[0].ignore && g.hp(511) == 1000);
+    // A rise to the host's value shows no damage number (guest rule 2); a later drop shows one.
+    g.inbox.push_back(msg("SBF11 hp 1 2 0 101:1200:100:200"));
     frame(g, *e, t + 16);
     assert(g.calls.size() == 2 && g.calls[1].delta == 200 && !g.calls[1].notify && g.hp(511) == 1200);
+    g.inbox.push_back(msg("SBF11 hp 1 3 0 101:1100:100:200"));
+    frame(g, *e, t + 32);
+    assert(g.calls.size() == 3 && g.calls[2].delta == -100 && g.calls[2].notify && g.hp(511) == 1100);
   }
 
   // ---- Kills: our EVE as the cause (F3), the floors ----
@@ -712,29 +3386,29 @@ int main() {
       g.spawn(101 + i, 5001 + i, 0);
     g.body(104).immortal = true;
     g.mem.put<float>(g.fsb(105) + kMinimumHp, 100);
-    g.inbox.push_back(msg("SBF9 on"));
+    g.inbox.push_back(msg("SBF11 on"));
     frame(g, *e, 0);
     lines(g);
     // A lethal claim: the kill passes this PC's EVE, found by the census (+0xbc == 1, the manager's local actor).
-    g.inbox.push_back(msg("SBF9 hit 1 1 101 1600 0 0 1600 1"));
+    g.inbox.push_back(msg("SBF11 hit 1 1 101 1600 0 0 1600 1"));
     frame(g, *e, 16);
     const Game::Call &c = g.calls.back();
     assert(c.la == g.by_guid[101] && c.type == 1 && c.delta == -1600 && c.cause == g.eve && c.notify && c.ignore);
-    assert(g.body(101).deaths == 1 && g.body(101).killer == g.eve && lines(g) == "SBF9 dead 1 101\n");
+    assert(g.body(101).deaths == 1 && g.body(101).killer == g.eve && lines(g) == "SBF11 dead 1 101\n");
     // Immortal holds HP at 1, MinimumHP at its value: dead-floored, no dead.
-    g.inbox.push_back(msg("SBF9 hit 1 2 104 1600 0 0 1600 1"));
-    g.inbox.push_back(msg("SBF9 hit 1 3 105 1600 0 0 1600 1"));
+    g.inbox.push_back(msg("SBF11 hit 1 2 104 1600 0 0 1600 1"));
+    g.inbox.push_back(msg("SBF11 hit 1 3 105 1600 0 0 1600 1"));
     frame(g, *e, 32);
     assert(g.hp(104) == 1 && g.hp(105) == 100 && e->host.counts.floored == 2 && !has(lines(g), "dead"));
     // Still controlled, but no longer the manager's local actor: a null cause (no kill rewards), counted.
     g.mem.put(g.players, g.mem.alloc(0x2608));
-    g.inbox.push_back(msg("SBF9 hit 1 4 102 1600 0 0 1600 1"));
+    g.inbox.push_back(msg("SBF11 hit 1 4 102 1600 0 0 1600 1"));
     frame(g, *e, 48);
     assert(g.calls.back().cause == 0 && g.body(102).deaths == 1 && e->counts.no_eve == 1);
     // No EVE in the map at all: the same.
     g.mem.put(g.players, g.fsb(1));
     g.unlink(1);
-    g.inbox.push_back(msg("SBF9 hit 1 5 103 1600 0 0 1600 1"));
+    g.inbox.push_back(msg("SBF11 hit 1 5 103 1600 0 0 1600 1"));
     frame(g, *e, 64);
     assert(g.calls.back().cause == 0 && g.body(103).deaths == 1 && e->counts.no_eve == 2 && !e->latched());
   }
@@ -824,7 +3498,7 @@ int main() {
 
     // Off: the job stops at its next turn. On again: armed at once, and a new session (a new Host, generation 1).
     g.spawn(101, 5001, 0);
-    g.inbox.push_back(msg("SBF9 on"));
+    g.inbox.push_back(msg("SBF11 on"));
     for (const uint64_t end = t + 300; t < end; t += 16)
       frame(g, *e, t);
     assert(e->host.linked() == 1);
@@ -887,12 +3561,12 @@ int main() {
     const uint64_t tags = g.mem.alloc(0x220), pauser = rebased(coop::nightop::kGlobals) + kPauseAt;
     g.mem.put(pauser, tags);
     g.spawn(101, 5001, 0);
-    g.inbox.push_back(msg("SBF9 on"));
+    g.inbox.push_back(msg("SBF11 on"));
     uint64_t t = 0;
     for (; t < 1000; t += 16)
       frame(g, *e, t);
     const uint64_t turns = e->counts.turns;
-    assert(e->counts.arms == 1 && e->host.linked() == 1 && has(lines(g), "SBF9 on\n"));
+    assert(e->counts.arms == 1 && e->host.linked() == 1 && has(lines(g), "SBF11 on\n"));
     g.mem.put<int32_t>(tags + kTagsNum, 1); // A tag: the set's one element.
     for (const uint64_t end = t + 60000; t < end; t += 16) {
       assert(!e->arm(g, t));
@@ -908,7 +3582,7 @@ int main() {
       frame(g, *e, t);
     const std::string sent = lines(g);
     assert(e->counts.arms == 2 && e->counts.turns > turns + 50 && e->counts.stale == 0 && !e->latched());
-    assert(e->host.linked() == 1 && !has(sent, "SBF9 on") && !has(sent, "SBF9 up") && has(sent, "SBF9 hp"));
+    assert(e->host.linked() == 1 && !has(sent, "SBF11 on") && !has(sent, "SBF11 up") && has(sent, "SBF11 hp"));
     assert(e->counts.paused == 60000 / 16);
     // An implausible pointer where the pause tags' singleton should be: off for the run.
     g.mem.put<uint64_t>(pauser, 0x1235);
@@ -1020,8 +3694,8 @@ int main() {
     auto eh = engine(true, true), eg = engine(true, false);
     H.spawn(100, 7000, 0, kChar, 100000);
     G.spawn(900, 7000, 0, kChar, 100000);
-    H.inbox.push_back(msg("SBF9 on")); // Each worker's on.
-    G.inbox.push_back(msg("SBF9 on"));
+    H.inbox.push_back(msg("SBF11 on")); // Each worker's on.
+    G.inbox.push_back(msg("SBF11 on"));
     const auto relay = [](Game &from, Game &to) {
       for (const Message &m : from.sent)
         to.inbox.push_back(msg(format(m)));
@@ -1049,7 +3723,7 @@ int main() {
       frame(G, *eg, t);
       claimed = !G.sent.empty() && G.sent.back().type == Type::hit;
     }
-    H.inbox.push_back(msg("SBF9 on"));
+    H.inbox.push_back(msg("SBF11 on"));
     eg->set(true, false);
     relay(G, H);
     {
@@ -1085,9 +3759,9 @@ int main() {
       return mail.take([&](const Message &m) { out.push_back(format(m)); },
                        [&](const Event &ev) { said.push_back(line(ev)); });
     };
-    mail.send(msg("SBF9 up 1 101 5001 0 900 1600"));
+    mail.send(msg("SBF11 up 1 101 5001 0 900 1600"));
     mail.event(Event{"paired", "", 101, 5001, 0});
-    mail.send(msg("SBF9 hp 1 1 0 101:1600:100:200"));
+    mail.send(msg("SBF11 hp 1 1 0 101:1600:100:200"));
     take();
     assert(out.empty() && said.empty());
     Snapshot s;
@@ -1097,40 +3771,40 @@ int main() {
     armed.arms = 5, armed.deferred = 2, armed.forced = 1, armed.paused = 3;
     mail.armed(armed, 77);
     Snapshot got = take();
-    assert((out == std::vector<std::string>{"SBF9 up 1 101 5001 0 900 1600", "SBF9 hp 1 1 0 101:1600:100:200"}));
+    assert((out == std::vector<std::string>{"SBF11 up 1 101 5001 0 900 1600", "SBF11 hp 1 1 0 101:1600:100:200"}));
     assert((said == std::vector<std::string>{"paired 5001:0 hguid=101"}) && got.runs == 7 && got.lost == 0);
     assert(got.job.arms == 5 && got.job.deferred == 2 && got.job.forced == 1 && got.job.paused == 3 &&
            got.game_thread == 77);
     // Hers: in at the next hand-over, in order; dropped when cleared before it.
     Message m;
-    assert(mail.give(msg("SBF9 world 3")) && mail.give(msg("SBF9 on")) && !mail.receive(m));
+    assert(mail.give(msg("SBF11 world 3")) && mail.give(msg("SBF11 on")) && !mail.receive(m));
     assert(mail.exchange(s) && mail.receive(m) && m.type == Type::world && m.gen == 3 && mail.receive(m) &&
            m.type == Type::on && !mail.receive(m));
-    assert(mail.give(msg("SBF9 world 4")));
+    assert(mail.give(msg("SBF11 world 4")));
     mail.clear();
     assert(mail.exchange(s) && !mail.receive(m));
     // Handed over but not taken yet: dropped too, even before a hand-over (the next try_lock may find it busy); hers
     // given after the clear still arrive.
-    assert(mail.give(msg("SBF9 world 5")) && mail.exchange(s));
+    assert(mail.give(msg("SBF11 world 5")) && mail.exchange(s));
     mail.clear();
-    assert(!mail.receive(m) && mail.give(msg("SBF9 world 6")) && mail.exchange(s));
+    assert(!mail.receive(m) && mail.give(msg("SBF11 world 6")) && mail.exchange(s));
     assert(mail.receive(m) && m.type == Type::world && m.gen == 6 && !mail.receive(m));
     // Full: one past kMail is lost on the job's side, refused on hers.
     out.clear();
     for (size_t i = 0; i <= kMail; ++i)
-      mail.send(msg("SBF9 on"));
+      mail.send(msg("SBF11 on"));
     assert(mail.exchange(s) && take().lost == 1 && out.size() == kMail);
     for (size_t i = 0; i < kMail; ++i)
-      assert(mail.give(msg("SBF9 on")));
-    assert(!mail.give(msg("SBF9 on")) && mail.exchange(s));
+      assert(mail.give(msg("SBF11 on")));
+    assert(!mail.give(msg("SBF11 on")) && mail.exchange(s));
     for (size_t i = 0; i < kMail; ++i)
       assert(mail.receive(m));
     assert(!mail.receive(m));
     // Busy: the worker holds the lock (its take), so the logic thread's hand-over returns at once.
     out.clear();
-    mail.send(msg("SBF9 world 5"));
+    mail.send(msg("SBF11 world 5"));
     assert(mail.exchange(s));
-    mail.send(msg("SBF9 world 6"));
+    mail.send(msg("SBF11 world 6"));
     bool busy = false;
     mail.take(
         [&](const Message &) {
@@ -1142,7 +3816,7 @@ int main() {
     take();
     assert(out.empty() && mail.exchange(s));
     take();
-    assert((out == std::vector<std::string>{"SBF9 world 6"}));
+    assert((out == std::vector<std::string>{"SBF11 world 6"}));
   }
   // The worker: refusals, waiting for her, starting and pausing with her link and the loaded save, her lines in and
   // ours out as text, the stats line, the gate while on, the lobby changing hands, off, and the latch.
@@ -1174,33 +3848,34 @@ int main() {
     assert(w.status() == " fight=waiting" && ask("fight on 900") == "shared fight is already on (on)");
     assert(w.detail() == "fight=waiting mode=on why=no friend linked");
     asked = 0;
-    w.pass(t, true, false, true, none, gate, io);
-    assert(e->on() && asked == 1 && io.lines() == "SBF9 on\n" && io.said.back() == "shared fight on: as guest");
-    assert(w.status() == " fight=on 0");
+    // A same-place enemies' show line (pilot.h) from her is neither malformed nor the job's.
+    w.pass(t, true, false, true, {"SBF11 show-stop 1 101 0 1 1000"}, gate, io);
+    assert(e->on() && asked == 1 && io.lines() == "SBF11 on\n" && io.said.back() == "shared fight on: as guest");
+    assert(w.status() == " fight=on 0" && !io.saying("malformed") && mail.exchange(s) && !mail.receive(m));
     // Her lines, parsed: the good ones reach the job at its next hand-over; a malformed one is said once, her off with
     // its reason.
     io.said.clear();
-    w.pass(t += 16, true, false, true, {"SBF9 world 2", "junk", "SBF9 nope", "SBF9 off busy"}, gate, io);
+    w.pass(t += 16, true, false, true, {"SBF11 world 2", "junk", "SBF11 nope", "SBF11 off busy"}, gate, io);
     assert((io.said == std::vector<std::string>{"fight: a malformed line from her dropped (said once a session)",
                                                 "fight: her shared fight off: busy"}));
     assert(mail.exchange(s) && mail.receive(m) && m.type == Type::world && mail.receive(m) && m.type == Type::off &&
            !mail.receive(m));
     // Her off again is not said again until her state changes.
     io.said.clear();
-    w.pass(t += 16, true, false, true, {"SBF9 off busy", "SBF9 on", "SBF9 off later"}, gate, io);
+    w.pass(t += 16, true, false, true, {"SBF11 off busy", "SBF11 on", "SBF11 off later"}, gate, io);
     assert((io.said == std::vector<std::string>{"fight: her shared fight off: later"}));
     assert(mail.exchange(s));
     while (mail.receive(m))
       ;
     // The job's lines go out as text (hp unreliable), its events into the log.
     io.said.clear();
-    mail.send(msg("SBF9 hit 2 1 101 100 0 0 1600 0"));
-    mail.send(msg("SBF9 hp 1 1 0 101:1500:100:200"));
+    mail.send(msg("SBF11 hit 2 1 101 100 0 0 1600 0"));
+    mail.send(msg("SBF11 hp 1 1 0 101:1500:100:200"));
     mail.event(Event{"paired", "", 101, 5001, 0});
     s.paired = 1, s.session = e->session(); // The session's first turn ran.
     assert(mail.exchange(s));
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(io.lines() == "SBF9 hit 2 1 101 100 0 0 1600 0\nSBF9 hp 1 1 0 101:1500:100:200 (unreliable)\n");
+    assert(io.lines() == "SBF11 hit 2 1 101 100 0 0 1600 0\nSBF11 hp 1 1 0 101:1500:100:200 (unreliable)\n");
     assert((io.said == std::vector<std::string>{"fight paired 5001:0 hguid=101"}) && w.status() == " fight=on 1");
     // A stats line traced in the second its side's counts moved, then none until they move again or a minute passed.
     io.said.clear(), io.traced.clear();
@@ -1215,38 +3890,65 @@ int main() {
       w.pass(t, true, false, true, none, gate, io);
     assert(io.said.empty() && io.traced.size() == 2);
     assert(has(w.detail(), "fight=on mode=on role=guest pairs=1 ") && has(w.detail(), " her=waiting"));
+    // coop fight status lists the host's enemies left unpaired and ours the host lacks; the fight= line counts them.
+    s.unshared[0] = Unshared{5003, 0, "charId"}, s.unshared[1] = Unshared{5005, 1, "maxhp"};
+    s.unshared_all = 2, s.maxhp = 1, s.lonely = 3;
+    assert(mail.exchange(s));
+    w.pass(t += 16, true, false, true, none, gate, io);
+    const std::string status = ask("fight status");
+    assert(has(status, " desync=0 unpaired=2 maxhp=1 ") &&
+           has(status, "; unpaired: 5003:0 charId, 5005:1 maxhp; 3 of ours not on the host's list"));
+    s.unshared_all = s.maxhp = s.lonely = 0;
+    assert(mail.exchange(s));
+    w.pass(t += 16, true, false, true, none, gate, io);
+    assert(!has(ask("fight status"), "; unpaired"));
+    // Same spawns in the fight= line, before the scaling: off, on with the guest's counts (created, despawned, and the
+    // refusals that say the two games differ), or stopped once the pilot's latch stopped them.
+    assert(has(w.detail(), " maxhp=0 spawns=off scale="));
+    s.spawning = true, s.spawns.spawned = 4, s.spawns.despawned = 3, s.spawns.refused = 5, s.spawns.differ = 2;
+    assert(mail.exchange(s));
+    w.pass(t += 1000, true, false, true, none, gate, io);
+    assert(has(w.detail(), " maxhp=0 spawns=on spawned=4 despawned=3 spawns_differ=2 scale="));
+    s.pilot_why = "stopped";
+    assert(mail.exchange(s));
+    w.pass(t += 1000, true, false, true, none, gate, io);
+    assert(has(w.detail(), " spawns=stopped spawned=4 despawned=3 spawns_differ=2 scale="));
+    s.spawning = false, s.pilot_why = "fight", s.spawns = SpawnCounts();
+    assert(mail.exchange(s));
+    w.pass(t += 1000, true, false, true, none, gate, io);
     // Her link lost: paused, nothing sent (she is gone); a new session when she is back.
     io.said.clear();
     w.pass(t += 16, false, false, true, none, gate, io);
     assert(!e->on() && io.lines().empty() && io.said.back() == "shared fight paused: no friend linked");
     assert(w.status() == " fight=waiting");
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(e->on() && io.lines() == "SBF9 on\n");
+    assert(e->on() && io.lines() == "SBF11 on\n");
     // Our player in photo mode: SB's logic stands still, so paused, and she hears why (her side stops sharing too); her
     // line not taken yet goes with the session. Asked meanwhile, it waits; a new session once it ends.
     const uint32_t before = e->session();
-    w.pass(t += 16, true, false, true, {"SBF9 world 8"}, gate, io, true);
-    assert(!e->on() && io.lines() == "SBF9 off photo mode\n" && io.said.back() == "shared fight paused: photo mode");
+    w.pass(t += 16, true, false, true, {"SBF11 world 8"}, gate, io, true);
+    assert(!e->on() && io.lines() == "SBF11 off photo mode\n" && io.said.back() == "shared fight paused: photo mode");
     assert(w.detail() == "fight=waiting mode=on her=on why=photo mode" && mail.exchange(s) && !mail.receive(m));
-    assert(ask("fight off") == "shared fight off: coop fight off" && io.lines() == "SBF9 off coop fight off\n");
+    assert(ask("fight off") == "shared fight off: coop fight off" && io.lines() == "SBF11 off coop fight off\n");
     assert(ask("fight on 900") == "shared fight on: waiting for the end of photo mode" && !e->on());
-    assert(io.lines() == "SBF9 off photo mode\n");
+    assert(io.lines() == "SBF11 off photo mode\n");
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(e->on() && e->session() == before + 1 && io.lines() == "SBF9 on\n");
+    assert(e->on() && e->session() == before + 1 && io.lines() == "SBF11 on\n");
     assert(io.said.back() == "shared fight on: as guest");
     // A load (no save for a while), on a pass the gate is due: paused, not off; she hears why, and her line not taken
     // yet goes with the session.
-    w.pass(t += 16, true, false, true, {"SBF9 world 9"}, gate, io);
+    w.pass(t += 16, true, false, true, {"SBF11 world 9"}, gate, io);
     loaded = false;
     w.pass(t += kGateMs, true, false, false, none, gate, io);
-    assert(!e->on() && io.lines() == "SBF9 off no save loaded\n" && io.said.back() == "shared fight paused: no save loaded");
+    assert(!e->on() && io.lines() == "SBF11 off no save loaded\n" &&
+           io.said.back() == "shared fight paused: no save loaded");
     assert(mail.exchange(s) && !mail.receive(m));
     // The save loaded meanwhile is our own: on waits for a co-op save, and she hears why. Back on a co-op save, it
     // starts again within 250 ms, nothing asked.
     loaded = true;
     why = std::string(kNoCoopSave) + " (slot=main index=0 marker=4 saves=main)";
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(!e->on() && io.lines() == "SBF9 off not on a co-op save\n" && w.status() == " fight=waiting");
+    assert(!e->on() && io.lines() == "SBF11 off not on a co-op save\n" && w.status() == " fight=waiting");
     assert(w.detail() == "fight=waiting mode=on her=on why=not on a co-op save");
     asked = 0;
     for (const uint64_t end = t + 1000; t < end;)
@@ -1255,7 +3957,7 @@ int main() {
     why.clear();
     for (const uint64_t end = t + 300; !e->on() && t < end;)
       w.pass(t += 16, true, false, true, none, gate, io);
-    assert(e->on() && io.lines() == "SBF9 on\n" && io.said.back() == "shared fight on: as guest");
+    assert(e->on() && io.lines() == "SBF11 on\n" && io.said.back() == "shared fight on: as guest");
     // While on, the gate is asked every 250 ms, not at every pass; our own save pauses it; coop off turns it off.
     asked = 0;
     for (const uint64_t end = t + 1000; t < end;)
@@ -1264,35 +3966,35 @@ int main() {
     why = std::string(kNoCoopSave) + " (slot=main index=1 marker=none saves=main)";
     for (const uint64_t end = t + 300; e->on() && t < end;)
       w.pass(t += 16, true, false, true, none, gate, io);
-    assert(!e->on() && io.lines() == "SBF9 off not on a co-op save\n" &&
+    assert(!e->on() && io.lines() == "SBF11 off not on a co-op save\n" &&
            io.said.back() == "shared fight paused: not on a co-op save");
     why.clear();
     for (const uint64_t end = t + 300; !e->on() && t < end;)
       w.pass(t += 16, true, false, true, none, gate, io);
-    assert(e->on() && io.lines() == "SBF9 on\n");
+    assert(e->on() && io.lines() == "SBF11 on\n");
     why = "coop off";
     for (const uint64_t end = t + 300; e->on() && t < end;)
       w.pass(t += 16, true, false, true, none, gate, io);
-    assert(!e->on() && io.lines() == "SBF9 off coop off\n" && io.said.back() == "shared fight off: coop off");
+    assert(!e->on() && io.lines() == "SBF11 off coop off\n" && io.said.back() == "shared fight off: coop off");
     // The lobby changes hands: a new session on the other side.
     why.clear();
-    assert(ask("fight on 900") == "shared fight on: as guest" && io.lines() == "SBF9 on\n");
+    assert(ask("fight on 900") == "shared fight on: as guest" && io.lines() == "SBF11 on\n");
     w.pass(t += 16, true, true, true, none, gate, io);
-    assert(e->on() && io.lines() == "SBF9 on\n" && io.said.back() == "shared fight on: as host");
+    assert(e->on() && io.lines() == "SBF11 on\n" && io.said.back() == "shared fight on: as host");
     assert(ask("fight off") == "shared fight off: coop fight off" && !e->on());
-    assert(io.lines() == "SBF9 off coop fight off\n");
+    assert(io.lines() == "SBF11 off coop fight off\n");
     // The latch: said once, she hears it after what the job handed over before, its later lines go nowhere, and
     // nothing starts again this run.
-    assert(ask("fight on 900") == "shared fight on: as host" && io.lines() == "SBF9 on\n");
+    assert(ask("fight on 900") == "shared fight on: as host" && io.lines() == "SBF11 on\n");
     e->latch("fault");
-    mail.send(msg("SBF9 world 7"));
+    mail.send(msg("SBF11 world 7"));
     assert(mail.exchange(s));
     w.pass(t += 16, true, true, true, none, gate, io);
     assert(!e->on() && io.said.back() == "shared fight off: stopped for this run (fault)");
-    assert(io.lines() == "SBF9 world 7\nSBF9 off stopped for this run (fault)\n" && w.status() == " fight=stopped");
+    assert(io.lines() == "SBF11 world 7\nSBF11 off stopped for this run (fault)\n" && w.status() == " fight=stopped");
     assert(ask("fight on 900") == "shared fight off: stopped for this run (fault)");
     io.said.clear();
-    mail.send(msg("SBF9 world 8"));
+    mail.send(msg("SBF11 world 8"));
     assert(mail.exchange(s));
     w.pass(t += 16, true, true, true, none, gate, io);
     assert(io.said.empty() && io.lines().empty() && !e->on());
@@ -1314,23 +4016,23 @@ int main() {
     w.pass(t, false, false, true, none, gate, io);
     assert(io.lines().empty() && w.detail() == "fight=off");
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(io.lines() == "SBF9 off shared enemies off\n" && w.detail() == "fight=off her=?");
+    assert(io.lines() == "SBF11 off shared enemies off\n" && w.detail() == "fight=off her=?");
     for (const uint64_t end = t + 4900; t < end;)
       w.pass(t += 16, true, false, true, none, gate, io);
     assert(io.lines().empty());
     w.pass(t += 200, true, false, true, none, gate, io);
-    assert(io.lines() == "SBF9 off shared enemies off\n");
+    assert(io.lines() == "SBF11 off shared enemies off\n");
     const std::vector<std::pair<std::string, std::string>> hers = {
-        {"SBF9 off not on a co-op save", "own-save"},
-        {"SBF9 off not on the co-op save (slot=main index=1 marker=none)", "own-save"}, // An older build's gate.
-        {"SBF9 off shared enemies off", "off"},
-        {"SBF9 off coop fight off", "off"},
-        {"SBF9 off stopped for this run (fault)", "stopped"},
-        {"SBF9 off photo mode", "waiting"},
-        {"SBF9 off no save loaded", "waiting"},
-        {"SBF9 on", "on"},
-        {"SBF9 off no friend linked", "waiting"},
-        {"SBF9 world 3", "on"}};
+        {"SBF11 off not on a co-op save", "own-save"},
+        {"SBF11 off not on the co-op save (slot=main index=1 marker=none)", "own-save"}, // An older build's gate.
+        {"SBF11 off shared enemies off", "off"},
+        {"SBF11 off coop fight off", "off"},
+        {"SBF11 off stopped for this run (fault)", "stopped"},
+        {"SBF11 off photo mode", "waiting"},
+        {"SBF11 off no save loaded", "waiting"},
+        {"SBF11 on", "on"},
+        {"SBF11 off no friend linked", "waiting"},
+        {"SBF11 world 3", "on"}};
     io.said.clear();
     for (const auto &[line, state] : hers) {
       w.pass(t += 16, true, false, true, {line}, gate, io);
@@ -1345,17 +4047,28 @@ int main() {
     w.pass(t += 16, false, false, true, none, gate, io);
     assert(w.detail() == "fight=off" && io.lines().empty());
     w.pass(t += 16, true, false, true, none, gate, io);
-    assert(w.detail() == "fight=off her=?" && io.lines() == "SBF9 off shared enemies off\n");
+    assert(w.detail() == "fight=off her=?" && io.lines() == "SBF11 off shared enemies off\n");
     // A friend flipping her state: 32 lines in the log a link, then none.
     io.said.clear();
     for (int i = 0; i < 40; ++i)
-      w.pass(t += 16, true, false, true, {"SBF9 on", "SBF9 off photo mode"}, gate, io);
+      w.pass(t += 16, true, false, true, {"SBF11 on", "SBF11 off photo mode"}, gate, io);
     assert(io.said.size() == 32);
     // On with no list: taken (every Monster), and told while it waits.
-    assert(ask("fight on") == "shared fight on: as guest" && e->on() && io.lines() == "SBF9 on\n");
+    assert(ask("fight on") == "shared fight on: as guest" && e->on() && io.lines() == "SBF11 on\n");
     w.pass(t += 16, true, false, true, none, gate, io, true);
-    assert(!e->on() && io.lines() == "SBF9 off photo mode\n");
+    assert(!e->on() && io.lines() == "SBF11 off photo mode\n");
     assert(w.detail() == "fight=waiting mode=on her=waiting why=photo mode");
+    // As the guest, our own scaling is not used: said once a run, before the start line.
+    w.pass(t += 16, true, false, true, none, gate, io);
+    assert(ask("fight off").rfind("shared fight off", 0) == 0);
+    io.said.clear();
+    assert(ask("fight on scale 135 115") == "shared fight on: as guest");
+    const std::string ours = "shared fight: as guest, the host's enemy_hp_scale and enemy_balance_scale count for "
+                             "both games; ours (135 %, 115 %) are not used";
+    assert(io.said == std::vector<std::string>{ours});
+    assert(ask("fight off").rfind("shared fight off", 0) == 0 && ask("fight on scale 135 115") ==
+           "shared fight on: as guest");
+    assert(io.said.size() == 1);
   }
 
   // ---- The probe (T11a's read-only half): every live actor each second, the world fence, its test writes ----
@@ -1367,6 +4080,7 @@ int main() {
     g.spawn(102, 5002, 0, 901); // Not on the allowlist.
     g.spawn(103, 0, 0);         // No EventSpawnId.
     g.mem.put<float>(g.stat_at(102, kHp), std::nanf("")); // Shown as -1: never latched on.
+    g.knock(101, 3000300); // Down, with its state.
     const auto probed = [&](uint32_t guid) {
       for (auto it = g.probes.rbegin(); it != g.probes.rend(); ++it)
         if (it->seen.guid == guid)
@@ -1380,6 +4094,7 @@ int main() {
     assert(g.probes.size() == 4 && g.calls.empty() && !e->latched());
     assert(probed(1).eve && probed(1).player && !probed(101).eve && probed(101).seen.spawn == 5001);
     assert(probed(101).seen.value[kHp] == 1600 && probed(101).seen.max[kHp] == 1600);
+    assert(probed(101).seen.cc == 1 << 1 && probed(101).seen.stunned && probed(101).states == 1u << 6);
     assert(probed(102).seen.value[kHp] == -1);
     Snapshot snap = e->snapshot();
     assert(snap.actors == 4 && snap.eve && snap.job.censuses == 1);
@@ -1464,6 +4179,7 @@ int main() {
       }
     };
     g.spawn(101, 5001, 0);
+    g.state(101, 27, 1); // Immortal: the probe's line names the states it holds among those read.
     assert(ask("fight test hp -10") == "shared fight test refused: only while coop fight probe runs");
     assert(ask("fight probe 900") == "shared fight probe: waiting for a loaded save" && !e->on());
     assert(w.detail() == "fight=waiting mode=probe why=no save loaded" && w.status() == " fight=waiting");
@@ -1478,7 +4194,12 @@ int main() {
         "fight probe guid=1 key=0:0 chr=0 type=1 life=1 hp=1600/1600 sh=100/100 st=200/200 eve player";
     const std::string fresh =
         "fight probe guid=101 key=5001:0 chr=900 type=3 life=1 hp=1600/1600 sh=100/100 st=200/200";
-    assert(io.tracing(eve) == 1 && io.tracing(fresh) == 1 && io.saying("fight writes=armed: ") == 1);
+    assert(io.tracing(eve) == 1 && io.tracing(fresh + " states=27") == 1 && io.saying("fight writes=armed: ") == 1);
+    g.knock(101, 9900001); // Long enough for the next census.
+    g.body(101).effects.back().left = 1000;
+    run(t + 1000);
+    assert(io.tracing(fresh + " states=8,27 cc=9900001") == 1);
+    g.body(101).effects.back().left = 1;
     assert(io.tracing("fight stats: probe, 2 actors, our EVE found") == 1 && io.lines().empty());
     assert(!io.saying("fight probe guid=") && !io.saying("fight stats") && w.status() == " fight=probe");
     g.hit(101, kHp, 100);
@@ -1486,7 +4207,7 @@ int main() {
     assert(io.tracing(eve) == 1 &&
            io.tracing("fight probe guid=101 key=5001:0 chr=900 type=3 life=1 hp=1500/1600 ") == 1);
     // A friend linked meanwhile: her lines never reach the probe's job.
-    w.pass(t, true, false, true, {"SBF9 on", "SBF9 hit 1 1 101 10 0 0 1600 0"}, gate, io);
+    w.pass(t, true, false, true, {"SBF11 on", "SBF11 hit 1 1 101 10 0 0 1600 0"}, gate, io);
     frame(g, *e, t += 16);
     Message m;
     assert(!mail->receive(m) && !io.saying("malformed"));
@@ -1514,6 +4235,13 @@ int main() {
     assert(io.tracing("chr=7003 type=3 life=1 hp=999999/999999 sh=100/100 st=200/200 left_out=MaxHP") == 1);
     assert(!io.tracing("chr=900 type=3 life=1 hp=1490/1600 sh=100/100 st=200/200 left_out"));
     assert(io.tracing("chr=900 type=3 life=1 hp=1490/1600 sh=100/100 st=200/200") == 2);
+    // coop fight spawn probe: the probe with same spawns' reads, said in its fight= line.
+    assert(!has(w.detail(), "spawns="));
+    ask("fight off");
+    g.spawns(), g.zone(0xA1, 40), g.enter(0xA1);
+    ask("fight probe spawns");
+    run(t + 1000);
+    assert(has(w.detail(), " writes=armed spawns=probe sim_us=") && io.saying("fight spawns probe 5001:0 no row") == 1);
   }
 
   // ---- Record on one PC, replay into another's guest: T11a's solo test of both roles ----
@@ -1538,10 +4266,12 @@ int main() {
       w.pass(t, false, false, true, none, gate, io);
       assert(w.ask(coop::parse_request("fight record 900"), gate, io) ==
              "shared fight record: as host, into coop-fight-record.txt when coop fight off ends it");
-      const std::vector<std::string> her = {"SBF9 on", "SBF9 hit 1 1 101 10 0 0 1600 0"}; // Her guest's claim.
+      const std::vector<std::string> her = {"SBF11 on", "SBF11 hit 1 1 101 10 0 0 1600 0"}; // Her guest's claim.
       for (; t < 2500; t += 16) {
         if (t == 512)
           H.hit(101, kHp, 300);
+        if (t == 800)
+          H.knock(102, 3000300);
         if (t == 1504)
           H.hit(101, kHp, 1300);
         frame(H, *e, t);
@@ -1554,11 +4284,12 @@ int main() {
       assert(said.rfind("shared fight off: coop fight off; ", 0) == 0);
       assert(has(said, " lines written to coop-fight-record.txt"));
       // The friend linked for a pass heard only that we do not share with her.
-      assert(io.has_file && io.lines() == "SBF9 off shared enemies off\n" && !e->on());
+      assert(io.has_file && io.lines() == "SBF11 off shared enemies off\n" && !e->on());
       std::vector<Line> lines;
       assert(!parse_recording(io.file, lines) && lines[0].message.type == Type::world);
-      assert(has(io.file, " SBF9 up 1 101 5001 0 900 1600\n") && has(io.file, " SBF9 up 1 102 5002 0 900 1600\n"));
-      assert(has(io.file, " 101:1300:100:200") && has(io.file, " SBF9 dead 1 101\n") && !has(io.file, " on"));
+      assert(has(io.file, " SBF11 up 1 101 5001 0 900 1600\n") && has(io.file, " SBF11 up 1 102 5002 0 900 1600\n"));
+      assert(has(io.file, " 101:1300:100:200") && has(io.file, " SBF11 dead 1 101\n") && !has(io.file, " on"));
+      assert(has(io.file, " SBF11 cc 1 102 3000300\n"));
       recording = io.file;
       // A second session shows none of the first one's counts, not even before its job's first turn.
       assert(w.ask(coop::parse_request("fight record 900"), gate, io).rfind("shared fight record: ", 0) == 0);
@@ -1570,6 +4301,82 @@ int main() {
         w.pass(t, false, false, true, none, gate, io);
       }
       assert(has(w.detail(), "fight=on mode=record role=host enemies=1 ") && w.status() == " fight=on 1");
+    }
+    { // Same-place enemies: the request's place word is the host's same_place, which the recording keeps as a place
+      // line; the pilot line says off why=fight until a mode that pairs runs, then the job's word. coop fight pilot
+      // off holds until the next start.
+      Game H;
+      auto mail = std::make_unique<Mail>();
+      H.mail = mail.get();
+      auto e = engine(false, false);
+      Worker w(*e, *mail);
+      Desk io;
+      H.spawn(101, 5001, 0);
+      uint64_t t = 0;
+      assert(w.pilot() == "off why=fight");
+      w.pass(t, false, false, true, none, gate, io);
+      assert(w.ask(coop::parse_request("fight record place"), gate, io).rfind("shared fight record: ", 0) == 0);
+      assert(w.pilot() == "off why=fight"); // Before its first turn.
+      const auto run = [&](uint64_t ms) {
+        for (const uint64_t from = t; t < from + ms; t += 16) {
+          frame(H, *e, t);
+          w.pass(t, false, false, true, none, gate, io);
+        }
+      };
+      run(200);
+      assert(w.pilot() == "on piloted=1");
+      e->pilot_off(true);
+      run(100);
+      assert(w.pilot() == "off why=asked");
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(has(io.file, " SBF11 place 1 1\n") && has(io.file, " SBF11 place 1 0\n"));
+      assert(w.pilot() == "off why=fight");
+      assert(w.ask(coop::parse_request("fight record"), gate, io).rfind("shared fight record: ", 0) == 0);
+      run(200);
+      assert(w.pilot() == "off why=setting"); // pilot off ended with the start; same_place off this time.
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(!has(io.file, "place"));
+      // aggro-host: the host's aggro=host, kept as an aggro line after the place line, read back with the recording;
+      // the next start without it is aggro=game again (no line).
+      assert(w.ask(coop::parse_request("fight record place aggro-host"), gate, io).rfind("shared fight record: ", 0) ==
+             0);
+      run(200);
+      w.ask(coop::parse_request("fight off"), gate, io);
+      std::vector<Line> back;
+      assert(has(io.file, " SBF11 place 1 1\n") && has(io.file, " SBF11 aggro 1 host\n") &&
+             !parse_recording(io.file, back));
+      assert(w.ask(coop::parse_request("fight record place"), gate, io).rfind("shared fight record: ", 0) == 0);
+      run(200);
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(has(io.file, " SBF11 place 1 1\n") && !has(io.file, "aggro"));
+      // spawns: the host's same_spawns=on, from the next start; its epoch line is never recorded. The stats line says
+      // whether same spawns run, and the epoch.
+      H.spawns(), H.zone(0xA1, 40), H.enter(0xA1);
+      assert(w.ask(coop::parse_request("fight record spawns"), gate, io).rfind("shared fight record: ", 0) == 0);
+      run(300);
+      io.traced.clear();
+      w.ask(coop::parse_request("fight status"), gate, io);
+      assert(io.tracing("; same spawns on, epoch 1 (ours moved 1 times), 0 rounds answered") == 1);
+      assert(has(w.detail(), " floored=0 spawns=on scale=")); // The host's: no counts of the guest's.
+      assert(io.tracing(", 0 refused, 0 differ, 0 stale, ") == 1);
+      assert(io.tracing("; extras 0 an enemy, 0 made, 0 despawned; job: ") == 1);
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(!has(io.file, "epoch") && !io.lines().size());
+      // extra: the host's enemy_extra, from the next start; the stats line says how many an enemy once its key range
+      // passed the check.
+      assert(w.ask(coop::parse_request("fight record spawns extra 2"), gate, io).rfind("shared fight record: ", 0) == 0);
+      run(300);
+      io.traced.clear();
+      w.ask(coop::parse_request("fight status"), gate, io);
+      assert(io.tracing("; extras 2 an enemy, ") == 1);
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(w.ask(coop::parse_request("fight record"), gate, io).rfind("shared fight record: ", 0) == 0);
+      run(300);
+      io.traced.clear();
+      w.ask(coop::parse_request("fight status"), gate, io);
+      assert(io.tracing("; same spawns off, epoch 0 (ours moved 0 times)") == 1);
+      assert(has(w.detail(), " floored=0 spawns=off scale="));
+      w.ask(coop::parse_request("fight off"), gate, io);
     }
     Game G;
     auto mail = std::make_unique<Mail>();
@@ -1593,25 +4400,111 @@ int main() {
     assert(ask("fight replay 900") == "shared fight replay refused: no coop-fight-record.txt (coop fight record makes "
                                       "one)");
     io.has_file = true;
-    io.file = "0 SBF9 hp 1 1 0 101:1600:100:200\n";
+    io.file = "0 SBF11 hp 1 1 0 101:1600:100:200\n";
     assert(ask("fight replay 900") ==
            "shared fight replay refused: coop-fight-record.txt fails its check (first line)");
     io.file = recording;
-    assert(ask("fight replay 900").rfind("shared fight replay: ", 0) == 0 && e->on());
+    assert(ask("fight replay confirmed 900").rfind("shared fight replay: ", 0) == 0 && e->on());
     // A linked friend's dead line for the host's 102 once paired: it would kill 902 if it reached the guest.
-    const std::vector<std::string> her = {"SBF9 dead 1 102"};
+    const std::vector<std::string> her = {"SBF11 dead 1 102"};
     for (const uint64_t from = t; t < from + 3500; t += 16) {
       frame(G, *e, t);
       w.pass(t, t == from + 1008, false, true, t == from + 1008 ? her : none, gate, io);
     }
     assert(count(G, "paired") == 2 && G.body(901).deaths == 1 && G.body(901).killer == G.eve);
     assert(G.body(902).deaths == 0 && G.hp(902) == 1600 && !e->latched());
+    // The host's knockdown of 102, played: started on 902 with this PC's EVE as the caster.
+    assert(G.casts.size() == 1 && G.casts[0].la == G.by_guid[902] && G.casts[0].caster == G.eve &&
+           G.casts[0].id == 3000300);
     bool followed = false; // The host's 300, before its kill.
     for (const Game::Call &c : G.calls)
       followed = followed || (c.la == G.by_guid[901] && c.type == 1 && c.delta == -300 && c.notify);
-    assert(followed && io.saying("fight replay: all ") == 1 && io.lines() == "SBF9 off shared enemies off\n" &&
+    assert(followed && io.saying("fight replay: all ") == 1 && io.lines() == "SBF11 off shared enemies off\n" &&
            !io.saying("malformed"));
     assert(has(w.detail(), "fight=on mode=replay role=guest pairs=1 ") && has(w.detail(), " kills=1 "));
+    // guest_kills=confirmed came with the request: both copies held our floor, 901's came off right before its kill,
+    // and 902's comes off with coop fight off.
+    std::vector<int> on901;
+    for (const Game::Call &c : G.calls)
+      if (c.la == G.by_guid[901] && (c.type == kFloorStat || c.cause))
+        on901.push_back(c.type == kFloorStat ? int(c.delta) : 0);
+    assert((on901 == std::vector<int>{1, -1, 0}) && G.mem.get<float>(G.fsb(902) + kMinimumHp) == 1);
+    assert(ask("fight off") == "shared fight off: coop fight off");
+    for (const uint64_t from = t; t < from + 100; t += 16) {
+      frame(G, *e, t);
+      w.pass(t, false, false, true, none, gate, io);
+    }
+    assert(G.mem.get<float>(G.fsb(902) + kMinimumHp) == 0 && e->snapshot().floors == 0);
+  }
+  // A request's words reach the sides through the worker: the host's scaling in a record (its scale line follows its
+  // world into the file; the fight= line says scale=), replayed into another PC's guest, which scales its copy by the
+  // recorded percents (a guest's own percents count for nothing) and says so too.
+  {
+    const auto gate = [] { return std::string(); };
+    const std::vector<std::string> none;
+    const auto max_hp = [](Game &g, uint32_t guid) { return g.mem.get<float>(g.fsb(guid) + kStatBase + 8); };
+    std::string recording;
+    {
+      Game H;
+      auto mail = std::make_unique<Mail>();
+      H.mail = mail.get();
+      auto e = engine(false, false);
+      Worker w(*e, *mail);
+      Desk io;
+      H.spawn(101, 5001, 0);
+      uint64_t t = 0;
+      w.pass(t, false, false, true, none, gate, io);
+      const auto ask = [&](const std::string &text) { return w.ask(coop::parse_request(text), gate, io); };
+      // Its scaling writes: refused before fight writes=armed, as a replay is.
+      assert(ask("fight record scale 135 115 900") == "shared fight record refused: its scaling writes, and writes are "
+                                                       "not armed yet (coop fight probe first)");
+      assert(ask("fight probe").rfind("shared fight probe: ", 0) == 0);
+      for (; !io.saying("fight writes=armed: ") && t < 1000; t += 16) {
+        frame(H, *e, t);
+        w.pass(t, false, false, true, none, gate, io);
+      }
+      assert(ask("fight off") == "shared fight off: coop fight off");
+      assert(ask("fight record scale 135 115 900").rfind("shared fight record:", 0) == 0);
+      for (const uint64_t from = t; t < from + 1500; t += 16) {
+        frame(H, *e, t);
+        w.pass(t, false, false, true, none, gate, io);
+      }
+      assert(has(w.detail(), " scale=135/115 sim_us=") && max_hp(H, 101) == 2160);
+      w.ask(coop::parse_request("fight off"), gate, io);
+      assert(has(io.file, " SBF11 world 1\n") && has(io.file, " SBF11 scale 1 135 115\n"));
+      assert(has(io.file, " SBF11 up 1 101 5001 0 900 1600\n") && has(io.file, " 101:2160:100:230"));
+      recording = io.file;
+    }
+    Game G;
+    auto mail = std::make_unique<Mail>();
+    G.mail = mail.get();
+    auto e = engine(false, false);
+    Worker w(*e, *mail);
+    Desk io;
+    const auto ask = [&](const std::string &text) { return w.ask(coop::parse_request(text), gate, io); };
+    G.spawn(901, 5001, 0);
+    uint64_t t = 0;
+    w.pass(t, false, false, true, none, gate, io);
+    assert(ask("fight probe").rfind("shared fight probe: ", 0) == 0);
+    for (; !io.saying("fight writes=armed: ") && t < 1000; t += 16) {
+      frame(G, *e, t);
+      w.pass(t, false, false, true, none, gate, io);
+    }
+    assert(ask("fight off") == "shared fight off: coop fight off" && max_hp(G, 901) == 1600);
+    io.has_file = true;
+    io.file = recording;
+    assert(ask("fight replay fought scale 200 200 900").rfind("shared fight replay: ", 0) == 0);
+    for (const uint64_t from = t; t < from + 1500; t += 16) {
+      frame(G, *e, t);
+      w.pass(t, false, false, true, none, gate, io);
+    }
+    assert(count(G, "paired") == 1 && max_hp(G, 901) == 2160 && has(w.detail(), " scale=135/115 sim_us="));
+    assert(ask("fight off") == "shared fight off: coop fight off");
+    for (const uint64_t from = t; t < from + 100; t += 16) {
+      frame(G, *e, t);
+      w.pass(t, false, false, true, none, gate, io);
+    }
+    assert(max_hp(G, 901) == 1600 && e->snapshot().scaled == 0);
   }
   // A recording stops at its cap: the mode ends and the file is written whole. Lines before its first world (an older
   // session's) and the job's on are left out; the host gets a guest's on at the start.
@@ -1628,12 +4521,12 @@ int main() {
     w.pass(t, false, false, true, none, gate, io);
     assert(w.ask(coop::parse_request("fight record 900"), gate, io).rfind("shared fight record: as host", 0) == 0);
     assert(mail->exchange(s) && mail->receive(m) && m.type == Type::on && !mail->receive(m));
-    mail->send(msg("SBF9 hp 1 1 0 101:1600:100:200"));
-    mail->send(msg("SBF9 on"));
-    mail->send(msg("SBF9 world 1"));
+    mail->send(msg("SBF11 hp 1 1 0 101:1600:100:200"));
+    mail->send(msg("SBF11 on"));
+    mail->send(msg("SBF11 world 1"));
     for (uint32_t batch = 1; e->on() && batch < 1000; ++batch) {
       for (size_t i = 0; i < kMail; ++i)
-        mail->send(msg("SBF9 hp 1 " + std::to_string(batch) + " 0 101:1600:100:200"));
+        mail->send(msg("SBF11 hp 1 " + std::to_string(batch) + " 0 101:1600:100:200"));
       assert(mail->exchange(s));
       w.pass(t += 16, false, false, true, none, gate, io);
     }
@@ -1647,18 +4540,29 @@ int main() {
   // ---- Two PCs through channel 2: 120 +/- 30 ms each way, 2 % of hp lines lost ----
   // Four enemies on each side, paired by key. Each is hit every 1.5 s by one player picked at random, until dead;
   // enemy 3 by the guest alone while her copy lives, and her lethal hit on it lands right after a heal that only the
-  // host's world ran (refused there: desync guest-dead); the guest's copy of enemy 1 is in NoDamage for 3 s.
-  {
+  // host's world ran (refused there: desync guest-dead); the guest's copy of enemy 1 is in NoDamage for 3 s. About one
+  // hit in three also knocks the enemy down, launches it or throws it at a wall, on that player's copy, when it is in
+  // no crowd control. Run at the default, then with the guest's guest_kills=confirmed (F4's fallback), where her
+  // refused lethal hit leaves her copy at 1 HP instead of a desync, and the host's two-player scaling (135 % HP, 115 %
+  // balance), which both worlds apply to their copies.
+  const auto two_pcs = [](bool confirmed) {
     Game H, G;
     auto eh = engine(true, true), eg = engine(true, false);
+    eg->confirm(confirmed);
+    if (confirmed)
+      eh->scale(135, 115); // Read at the session's first turn.
+    bool same_max = false; // Both copies of every enemy at the scaled MaxHP and MaxStamina at once.
     for (uint32_t i = 0; i < 4; ++i) {
       H.spawn(100 + i, 7000 + i, 0);
       G.spawn(900 + i, 7000 + i, 0);
     }
     Wire to_host, to_guest;
-    to_host.queue.emplace_back(120, "SBF9 on"); // Each worker sends its side's on.
-    to_guest.queue.emplace_back(120, "SBF9 on");
+    to_host.queue.emplace_back(120, "SBF11 on"); // Each worker sends its side's on.
+    to_guest.queue.emplace_back(120, "SBF11 on");
     std::mt19937 rng(1); // A run where both death paths happen and a lost hp line waits for the refresh.
+    std::mt19937 knock_rng(9); // With rng: the knocks' cc lines take their share of its numbers.
+    const int32_t kKnocks[] = {9900001, 3000300, 3000401};
+    uint64_t knocks[2] = {}; // The host's EVE's, the guest's.
     uint64_t next_hit[4], hits[4][2] = {}, died_h[4] = {}, died_g[4] = {};
     int64_t pending[4] = {-1, -1, -1, -1}, dealt = 0, claimed = 0; // HP her EVE took off her copies, and claimed.
     std::vector<uint64_t> fast, slow; // Hit to equal HP on both screens: within 250 ms + RTT (300), or not.
@@ -1669,7 +4573,7 @@ int main() {
     for (; t < end; t += 16) {
       to_host.deliver(t, H);
       to_guest.deliver(t, G);
-      G.body(901).nodamage = t >= 6000 && t < 9000;
+      G.state(901, 4, t >= 6000 && t < 9000);
       for (uint32_t i = 0; i < 4; ++i) {
         if (t < next_hit[i])
           continue;
@@ -1697,9 +4601,21 @@ int main() {
         }
         ++hits[i][who];
         pending[i] = int64_t(t);
+        Game &X = who == 0 ? H : G;
+        const uint32_t target = (who == 0 ? 100 : 900) + i;
+        if (knock_rng() % 3 == 0 && !X.dying(target) && !X.in_cc(X.by_guid[target])) {
+          X.knock(target, kKnocks[knock_rng() % 3]);
+          ++knocks[who];
+        }
       }
       frame(H, *eh, t);
       frame(G, *eg, t);
+      bool all_scaled = true;
+      for (uint32_t i = 0; i < 4; ++i)
+        for (const auto &[X, guid] : {std::pair<Game *, uint32_t>{&H, 100 + i}, {&G, 900 + i}})
+          all_scaled = all_scaled && X->mem.get<float>(X->fsb(guid) + kStatBase + 8) == 2160 &&
+                       X->mem.get<float>(X->fsb(guid) + kStatBase + 52) == 230;
+      same_max = same_max || all_scaled;
       for (uint32_t i = 0; i < 4; ++i) {
         if (!died_h[i] && H.dying(100 + i))
           died_h[i] = t;
@@ -1725,11 +4641,13 @@ int main() {
       if (all && end == 120000)
         end = t + 2000; // Two more seconds: no late line may kill anything twice.
     }
-    // 1. Both players' hits count on both screens (enemy 3: the guest's, then the host's after the desync).
+    // 1. Both players' hits count on both screens (enemy 3: the guest's, then the host's after the desync; with
+    // guest_kills=confirmed her copy lives on and she alone hits it to its death).
     for (uint32_t i = 0; i < 4; ++i)
-      assert(hits[i][0] && hits[i][1]);
-    // 2. The gap closes within 250 ms + RTT, but where an hp line was lost (the next comes with the 1 s refresh).
-    assert(fast.size() > 40 && slow.size() <= to_guest.lost);
+      assert((hits[i][0] || (confirmed && i == 3)) && hits[i][1]);
+    // 2. The gap closes within 250 ms + RTT, but where an hp line was lost (the next comes with the 1 s refresh). The
+    // first run's numbers lose one that a gap waits on; the second's lost lines may all fall between hits.
+    assert(fast.size() > 40 && (confirmed || !slow.empty()) && slow.size() <= to_guest.lost);
     for (uint64_t took : slow)
       assert(took <= 1000 + 150 + 3 * 16);
     // 3. Exactly one death per world per kill, each with that world's EVE as the cause (F3); the guest's copy never
@@ -1738,22 +4656,87 @@ int main() {
       assert(H.body(100 + i).deaths == 1 && G.body(900 + i).deaths == 1);
       assert(H.body(100 + i).killer == H.eve && G.body(900 + i).killer == G.eve);
       assert(died_g[i] <= died_h[i] + 550);
-      if (i < 3)
+      if (i < 3 || confirmed)
         assert(died_h[i] <= died_g[i] + 550);
     }
     assert(eh->host.counts.kills >= 1 && eg->guest.counts.kills >= 1); // Both death paths ran.
-    // 4. The refused lethal claim is counted once on each side.
-    assert(desynced && eg->guest.counts.desync == 1 && eh->host.counts.refused == 1);
+    // 4. The refused lethal claim is counted once on each side; with guest_kills=confirmed it is no desync.
+    assert(desynced && eg->guest.counts.desync == (confirmed ? 0 : 1) && eh->host.counts.refused == 1);
     // No echo (R35): what she claimed is exactly what her EVE dealt, and the host took every claim; no heal shown on
-    // her screen.
+    // her screen, but the one that raises her copy from the floor to the host's HP after the refusal.
     assert(claimed == dealt && eh->host.counts.claims == eg->guest.counts.claims);
-    for (const Game::Call &c : G.calls)
-      assert(c.type != 1 || c.delta < 0);
+    // The scaling's own rise follows its MaxHP write on the same copy, once a copy.
+    size_t raised = 0, floors = 0, scaled = 0;
+    for (size_t i = 0; i < G.calls.size(); ++i) {
+      const Game::Call &c = G.calls[i];
+      const bool scaling = i && G.calls[i - 1].type == kMaxHpValue && G.calls[i - 1].la == c.la && c.delta > 0;
+      raised += c.type == 1 && c.delta > 0 && !scaling;
+      scaled += c.type == 1 && scaling;
+      floors += c.type == kFloorStat && c.delta > 0;
+      assert(c.type != 1 || c.delta < 0 || scaling || (confirmed && c.la == G.by_guid[903]));
+    }
+    assert(raised == (confirmed ? 1 : 0) && floors == (confirmed ? 4 : 0) && scaled == (confirmed ? 4 : 0));
+    // Scaled on both PCs at once, each copy back at its own maxes once dead.
+    assert(same_max == confirmed && eg->snapshot().scaled == 0 && eh->snapshot().scaled == 0);
+    for (uint32_t i = 0; i < 4; ++i)
+      assert(G.mem.get<float>(G.fsb(900 + i) + kStatBase + 8) == 1600 &&
+             H.mem.get<float>(H.fsb(100 + i) + kStatBase + 8) == 1600);
+    // Every floor came off again (each before its copy's kill); the host never holds one.
+    for (uint32_t i = 0; i < 4; ++i)
+      assert(G.mem.get<float>(G.fsb(900 + i) + kMinimumHp) == 0 && H.mem.get<float>(H.fsb(100 + i) + kMinimumHp) == 0);
+    assert(eg->snapshot().floors == 0 && eh->snapshot().floors == 0);
+    // Crowd control both ways and never echoed: each side tells only its own EVE's knocks, and each cast answers one
+    // told by the other side, on a copy in none (the fake checks), with that world's EVE as the caster.
+    const Counts &hc = eh->host.counts, &gc = eg->guest.counts;
+    assert(knocks[0] && knocks[1] && !H.casts.empty() && !G.casts.empty());
+    assert(hc.cc_told && hc.cc_told <= knocks[0] && gc.cc_told && gc.cc_told <= knocks[1]);
+    assert(G.casts.size() == gc.cc_mirrored && gc.cc_mirrored + gc.cc_skipped <= hc.cc_told);
+    assert(H.casts.size() == hc.cc_mirrored && hc.cc_mirrored + hc.cc_skipped <= gc.cc_told);
+    for (const Game::Cast &c : H.casts)
+      assert(c.caster == H.eve);
+    for (const Game::Cast &c : G.casts)
+      assert(c.caster == G.eve);
     // 5. No latch, one arm each, no bad line.
     assert(!eh->latched() && !eg->latched() && eh->counts.arms == 1 && eg->counts.arms == 1);
     assert(eh->host.counts.bad == 0 && eg->guest.counts.bad == 0 && eh->counts.no_eve == 0 && eg->counts.no_eve == 0);
-    std::printf("fight_engine_test: ok (gap closed within 550 ms after %zu hits, later after %zu with %llu hp lines "
-                "lost)\n",
-                fast.size(), slow.size(), static_cast<unsigned long long>(to_guest.lost));
+    std::printf("fight_engine_test: ok%s (gap closed within 550 ms after %zu hits, later after %zu with %llu hp lines "
+                "lost; %zu and %zu crowd controls mirrored)\n",
+                confirmed ? ", guest_kills=confirmed, scaled 135/115" : "", fast.size(), slow.size(),
+                static_cast<unsigned long long>(to_guest.lost), G.casts.size(), H.casts.size());
+  };
+  two_pcs(false);
+  two_pcs(true);
+
+  // ---- Scaling as the guest joins, and for an enemy that spawns later: her copy never takes a drop ----
+  // At 135/115 and with no hit at all, for each phase of her census against the host's turns: an hp line the host
+  // sent before its engine scaled the enemy would bring her scaled copy down to the unscaled HP (a drop with a
+  // number), then back up.
+  for (uint64_t late = 0; late < 2 * kCensusTurns; ++late) {
+    Game H, G;
+    auto eh = engine(true, true), eg = engine(true, false);
+    eh->scale(135, 115);
+    H.spawn(50, 6000, 0);
+    G.spawn(950, 6000, 0);
+    Wire to_host, to_guest;
+    to_host.queue.emplace_back(120, "SBF11 on");
+    to_guest.queue.emplace_back(120, "SBF11 on");
+    std::mt19937 rng(1);
+    for (uint64_t t = 0; t < 4000; t += 16) {
+      if (t == 2000)
+        H.spawn(100, 7000, 0);
+      if (t == 1504)
+        G.spawn(900, 7000, 0);
+      to_host.deliver(t, H);
+      to_guest.deliver(t, G);
+      frame(H, *eh, t);
+      if (t >= late * 16)
+        frame(G, *eg, t);
+      to_guest.send(H, t, rng);
+      to_host.send(G, t, rng);
+    }
+    for (const Game::Call &c : G.calls)
+      assert(c.type != 1 || c.delta > 0); // HP only rises, with the scaling.
+    assert(G.hp(950) == 2160 && G.hp(900) == 2160 && H.hp(50) == 2160 && H.hp(100) == 2160);
   }
+  std::printf("fight_engine_test: ok (scaling at join and at a later spawn: no drop for any census phase)\n");
 }

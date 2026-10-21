@@ -21,6 +21,9 @@ WINDOWS = os.name == 'nt'  # Native Windows: Visual Studio Build Tools (clang-cl
 LUA = os.environ.get('STELLAR_LUA', 'lua5.4')
 CXX = os.environ.get('STELLAR_CXX', 'clang++' if WINDOWS else 'c++')
 EXE = '.exe' if WINDOWS else ''
+# The native tests keep fight mailboxes (442 KB each) on main's stack, as Linux's 8 MB stack allows; Windows gives 1 MB.
+# The DLL keeps them in globals, so only the tests need this.
+STACK = ['-Xlinker', '/STACK:16777216'] if WINDOWS else []
 MANIFEST = 'install-manifest.txt'
 RUNTIME = ('coop-*.log', 'coop-*.txt', '*.old.log')  # Written by the mod in game: never removed.
 OBSOLETE = {'steam-probe.txt'}  # Left by an old probe, before the manifest existed.
@@ -217,8 +220,8 @@ def main(argv=None):
         subprocess.run([sys.executable, test], cwd=ROOT, check=True)
     for test in sorted((ROOT / 'tests').glob('*_test.cpp')):  # Platform-free native code, run on this machine.
         exe = ROOT / 'build/host' / f'{test.stem}{EXE}'
-        subprocess.run([CXX, '-std=c++17', '-Wall', '-Wextra', '-Werror', *checks, '-I', ROOT / 'native/src', test,
-                        '-o', exe], check=True)
+        subprocess.run([CXX, '-std=c++17', '-Wall', '-Wextra', '-Werror', *checks, *STACK, '-I', ROOT / 'native/src',
+                        test, '-o', exe], check=True)
         subprocess.run([exe], check=True)
     ver = version()
     print(f'Version: {ver}', flush=True)

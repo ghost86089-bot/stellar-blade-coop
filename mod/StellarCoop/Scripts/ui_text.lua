@@ -1,7 +1,8 @@
--- The co-op menu's, the chat's, the partner HUD's, the co-op saves', the join codes', the shared enemies', the status
--- line's and the notices' words that the Lua side writes (D-UI8): English and French. The game's language picks them
--- (GetCurrentLanguage, as the recruiter reads it) unless ui_language=english; any other language reads English until
--- translated. Row ids and setting names are ui_model.lua's; a value's word is its id's (on, both, game...).
+-- The co-op menu's, the chat's, the partner HUD's, the co-op saves', the join codes', the shared enemies', same
+-- place's, same spawns', the status line's and the notices' words that the Lua side writes (D-UI8): English and French.
+-- The game's language picks them (GetCurrentLanguage, as the recruiter reads it) unless ui_language=english; any other
+-- language reads English until translated. Row ids and setting names are ui_model.lua's; a value's word is its id's
+-- (on, both, game...), or <setting>_<id> where one setting's value needs other words (aggro_game).
 local T={}
 T.en={
     title='CO-OP',
@@ -16,9 +17,13 @@ T.en={
         effects='Attack effects',send_rate='Poses sent a second',shared_enemies='Shared enemies (experimental)',
         ui_scale='Menu size',ui_sounds='Menu sounds',ui_language='Menu language',partner_bar='HP marker',
         partner_arrow='Off-screen arrow',partner_card='Partner card',card_details='Ping and map on the card',
-        who_can_join='Who can join',auto_coop_save='Co-op saves'},
+        who_can_join='Who can join',auto_coop_save='Co-op saves',enemy_hp_scale="Enemy HP (host's)",
+        enemy_balance_scale="Enemy balance (host's)",kill_credit='My kill rewards',
+        same_place='Same place (experimental)',aggro="Enemies attack (host's)",
+        same_spawns='Same spawns (experimental)',enemy_extra="Extra enemies (host's)"},
     value={on='On',off='Off',both='Both',notice='Notice only',game='Game language',english='English',friends='Friends',
-        code='With a code',private='Invited only',ask='Ask',always='Always'},
+        code='With a code',private='Invited only',ask='Ask',always='Always',all='Every shared enemy',
+        fought='Enemies I hit',aggro_game='Both players',aggro_host='The host only'},
     no_limit='No limit',minutes='%d min',seconds='%d s',percent='%d %%',press='Press a key',
     hint={move='Move',select='Select',back='Back'},
     confirm_leave='Select again within 3 s to leave.',confirm_remove='Select again within 3 s to remove %s.',
@@ -66,6 +71,7 @@ T.en={
     -- The shared enemies' notices (main.lua): on, off, stopped, and what keeps coop fight on from sharing (%s: her
     -- name). The title question's buttons are saves.convert and saves.play.
     fight={on='Shared enemies on: %d enemies linked.',one='Shared enemies on: 1 enemy linked.',
+        scale="Enemy HP %d %%, balance %d %% (the host's setting).",
         off='Shared enemies off. coop-link.log says why.',
         stopped='Shared enemies stopped until the game restarts. coop-link.log says why.',friend='your friend',
         you='Shared enemies need a co-op save, not your own. Quit to the title screen, choose Convert and play co-op '
@@ -76,7 +82,24 @@ T.en={
             ..'play co-op (or Play co-op).',
         her_off='Shared enemies wait: %s has them off (co-op menu, Options, Combat).',
         her_stopped="Shared enemies stopped for this run in %s's game. Their coop-link.log says why.",
-        map='Shared enemies wait until you and %s are on the same map.'},
+        map='Shared enemies wait until you and %s are on the same map.',
+        maxhp="Shared enemies: some enemies have another max HP in %s's game (another difficulty or New Game+). They "
+            ..'stay unshared.',
+        host_down='Shared enemies: %s is down. Once they respawn, the enemies you share go back to full health.',
+        paks='%s loads other .pak mods than you (%d there, %d here). Enemies that differ stay unshared.'},
+    -- Same place's notices (main.lua): how many enemies it moves, and why it went off (off with host or stopped; %s
+    -- in host: her name, or fight.friend).
+    pilot={on='Same place: %d enemies piloted.',one='Same place: 1 enemy piloted.',off='Same place off: %s',
+        host="%s's game turned it off.",stopped='stopped by an error until the game restarts. coop-link.log says why.'},
+    -- Same spawns' notices (main.lua): on, in the host's words or the guest's, stopped by same place's error, and
+    -- enemies that differ between the two games (%s: her name, or fight.friend).
+    spawns={host='Same spawns on: where you and %s stand within 100 m of each other in one zone, their game holds '
+            ..'the same common enemies as yours.',
+        guest='Same spawns on: where you and %s stand within 100 m of each other in one zone, your game holds the '
+            ..'same common enemies as theirs.',
+        stopped='Same spawns stopped by an error until the game restarts. coop-link.log says why.',
+        differ="Same spawns: some enemies differ between your game and %s's (other .pak mods or fight_chars) and "
+            ..'stay as they are. coop-link.log names them.'},
 }
 T.fr={
     title='CO-OP',
@@ -92,9 +115,13 @@ T.fr={
         send_rate='Poses envoyées par seconde',shared_enemies='Ennemis partagés (expérimental)',
         ui_scale='Taille du menu',ui_sounds='Sons du menu',ui_language='Langue du menu',partner_bar='Marqueur de vie',
         partner_arrow='Flèche hors écran',partner_card='Fiche du partenaire',card_details='Ping et zone sur la fiche',
-        who_can_join='Qui peut rejoindre',auto_coop_save='Sauvegardes co-op'},
+        who_can_join='Qui peut rejoindre',auto_coop_save='Sauvegardes co-op',enemy_hp_scale='PV des ennemis (hôte)',
+        enemy_balance_scale='Équilibre des ennemis (hôte)',kill_credit='Mes récompenses',
+        same_place='Même position (expérimental)',aggro='Les ennemis attaquent (hôte)',
+        same_spawns='Mêmes apparitions (expérimental)',enemy_extra='Ennemis en plus (hôte)'},
     value={on='Oui',off='Non',both='Les deux',notice='Avis seul',game='Langue du jeu',english='Anglais',friends='Amis',
-        code='Avec un code',private='Sur invitation',ask='Demander',always='Toujours'},
+        code='Avec un code',private='Sur invitation',ask='Demander',always='Toujours',all='Tous les ennemis partagés',
+        fought='Ceux que je frappe',aggro_game='Les deux joueurs',aggro_host="L'hôte seulement"},
     no_limit='Sans limite',minutes='%d min',seconds='%d s',percent='%d %%',press='Appuyez sur une touche',
     hint={move='Déplacer',select='Choisir',back='Retour'},
     confirm_leave='Choisissez encore dans les 3 s pour quitter.',
@@ -139,6 +166,7 @@ T.fr={
         paused="Le menu co-op ne s'ouvre pas quand le jeu est en pause ou affiche un menu."},
     ghost={failed='Le fantôme a échoué 3 fois : la raison est dans UE4SS.log.',away='%s est dans %s, vous êtes dans %s.'},
     fight={on='Ennemis partagés actifs : %d ennemis liés.',one='Ennemis partagés actifs : 1 ennemi lié.',
+        scale="PV des ennemis %d %%, équilibre %d %% (réglage de l'hôte).",
         off='Ennemis partagés coupés. coop-link.log dit pourquoi.',
         stopped="Ennemis partagés arrêtés jusqu'au redémarrage du jeu. coop-link.log dit pourquoi.",
         friend='votre partenaire',
@@ -150,7 +178,23 @@ T.fr={
             ..'avec Convertir et jouer en co-op (ou Jouer en co-op).',
         her_off='Ennemis partagés en attente : ils sont coupés chez %s (menu co-op, Options, Combat).',
         her_stopped='Ennemis partagés arrêtés pour cette partie chez %s. Son coop-link.log dit pourquoi.',
-        map="Ennemis partagés en attente : vous et %s n'êtes pas sur la même zone."},
+        map="Ennemis partagés en attente : vous et %s n'êtes pas sur la même zone.",
+        maxhp="Ennemis partagés : certains ennemis ont d'autres PV max dans la partie de %s (autre difficulté ou New "
+            ..'Game+). Ils ne sont pas partagés.',
+        host_down='Ennemis partagés : %s est à terre. Après sa réapparition, vos ennemis partagés reviennent à pleine '
+            ..'santé.',
+        paks="%s n'a pas les mêmes mods .pak que vous (%d en face, %d ici). Les ennemis qui diffèrent ne sont pas "
+            ..'partagés.'},
+    pilot={on='Même position : %d ennemis pilotés.',one='Même position : 1 ennemi piloté.',
+        off='Même position coupée : %s',host="la partie de %s l'a désactivée.",
+        stopped="arrêtée par une erreur jusqu'au redémarrage du jeu. coop-link.log dit pourquoi."},
+    spawns={host="Mêmes apparitions actives : là où vous et %s êtes à moins de 100 m l'un de l'autre dans une même "
+            ..'zone, sa partie a les mêmes ennemis communs que la vôtre.',
+        guest="Mêmes apparitions actives : là où vous et %s êtes à moins de 100 m l'un de l'autre dans une même "
+            ..'zone, votre partie a les mêmes ennemis communs que la sienne.',
+        stopped="Mêmes apparitions arrêtées par une erreur jusqu'au redémarrage du jeu. coop-link.log dit pourquoi.",
+        differ='Mêmes apparitions : certains ennemis diffèrent entre votre partie et celle de %s (autres mods .pak ou '
+            ..'fight_chars) et restent tels quels. coop-link.log les nomme.'},
 }
 -- The words for the game's culture (nil when unread) and ui_language.
 function T.pick(culture,setting)
