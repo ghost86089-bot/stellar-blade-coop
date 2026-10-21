@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -262,9 +263,9 @@ int main() {
   assert(policy(main_now, twin, Line()) == Act::keep);    // No line: by hand, another PC, a missing or bad manifest.
 
   // Whole passes on a temporary folder.
-  std::string tmpl = (fs::temp_directory_path() / "save_twins_test-XXXXXX").string();
-  assert(mkdtemp(tmpl.data()));
-  const fs::path root = tmpl;
+  // A new folder of our own (mkdtemp's job, which Windows lacks): create_directory fails on a name already taken.
+  const fs::path root = fs::temp_directory_path() / ("save_twins_test-" + std::to_string(std::random_device{}()));
+  assert(fs::create_directory(root));
   HostFs f;
   f.dir = root / "SaveGames" / "76561198000000000";
   f.backups = root / "StellarCoopBackups";

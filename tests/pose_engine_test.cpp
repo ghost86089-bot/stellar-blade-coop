@@ -10,19 +10,46 @@
 #include <array>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 
 using namespace coop::pose;
 
 namespace {
 template <class T> void put(std::vector<uint8_t> &mem, size_t at, T value) { std::memcpy(mem.data() + at, &value, sizeof value); }
 uintptr_t addr(std::vector<uint8_t> &mem, size_t at = 0) { return reinterpret_cast<uintptr_t>(mem.data() + at); }
-// ReadProcessMemory's Linux twin: fails instead of faulting on memory it cannot read.
+// ReadProcessMemory on ourselves (process_vm_readv on Linux): fails instead of faulting on memory it cannot read.
 bool read_self(uint64_t address, void *out, size_t n) {
+#ifdef _WIN32
+  SIZE_T got = 0;
+  return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(address), out, n, &got) && got == n;
+#else
   iovec local{out, n}, remote{reinterpret_cast<void *>(address), n};
   return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(n);
+#endif
+}
+// A page with no access, like an object's memory that went back to the system.
+void *no_access_page() {
+#ifdef _WIN32
+  return VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+#else
+  void *page = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return page == MAP_FAILED ? nullptr : page;
+#endif
+}
+void free_page(void *page) {
+#ifdef _WIN32
+  VirtualFree(page, 0, MEM_RELEASE);
+#else
+  munmap(page, 4096);
+#endif
 }
 
 // A fake GUObjectArray with one chunk, and objects registered in it.
@@ -395,8 +422,8 @@ int main() {
   {
     auto plain = safe_read;
     safe_read = read_self;
-    void *page = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    assert(page != MAP_FAILED);
+    void *page = no_access_page();
+    assert(page);
     auto freed = reinterpret_cast<uintptr_t>(page);
     const Part old{freed, eve_class, mesh, 3, true}, old_puppet{freed, poseable_class, mesh, 3, true};
     std::vector<uint8_t> bones(3 * kTransformBytes);
@@ -408,7 +435,7 @@ int main() {
     const std::vector<uint8_t> before = puppet;
     assert(write_mailbox(objs, addr(puppet), poseable_class, old_puppet, world, 1.f, 2.f) == Io::gone);
     assert(puppet == before);
-    munmap(page, 4096);
+    free_page(page);
     safe_read = plain;
   }
 

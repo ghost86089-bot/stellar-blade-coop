@@ -1036,8 +1036,11 @@ int main() {
       relay(G, H);
       t += 16;
     };
-    for (const uint64_t end = t + 1000; t < end;)
-      both();
+    {
+      const uint64_t end = t + 1000; // A while: both() moves t, which clang's -Wfor-loop-analysis cannot see.
+      while (t < end)
+        both();
+    }
     const uint64_t before = eh->host.counts.claims;
     assert(before >= 5 && eh->host.counts.bad == 0);
     // Her fight on again mid-fight: the worker's on goes out while a turn of the old guest still claims.
@@ -1049,8 +1052,11 @@ int main() {
     H.inbox.push_back(msg("SBF9 on"));
     eg->set(true, false);
     relay(G, H);
-    for (const uint64_t end = t + 1000; t < end;)
-      both();
+    {
+      const uint64_t end = t + 1000; // A while: both() moves t, which clang's -Wfor-loop-analysis cannot see.
+      while (t < end)
+        both();
+    }
     assert(eh->host.counts.bad == 0 && eh->host.counts.ignored == 0 && eh->host.counts.claims > before + 5);
   }
 

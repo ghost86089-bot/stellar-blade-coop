@@ -27,6 +27,23 @@ def run(*argv):
     return code, out.getvalue()
 
 
+def link_in(folder, target, outside):
+    """A link made inside folder, returned for its unlink: folder/link.sav -> target. Windows refuses file symlinks
+    without Developer Mode or admin (WinError 1314); a directory junction needs no right and must be refused the same
+    way, so it gets folder/link-dir -> outside (a folder outside the saves, so a walk that enters it never loops)."""
+    link = folder / 'link.sav'
+    try:
+        link.symlink_to(target)
+        return link
+    except OSError as error:
+        if getattr(error, 'winerror', None) != 1314: raise
+    import _winapi
+    link = folder / 'link-dir'
+    outside.mkdir(exist_ok=True)
+    _winapi.CreateJunction(str(outside), str(link))
+    return link
+
+
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     saves, to = tmp / 'SaveGames', tmp / 'backups'
@@ -102,11 +119,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # check with a missing folder is an error (2), never "every save removed" (1); symlinks are refused everywhere.
     assert run('--saves', tmp / 'absent', '--to', to, 'check')[0] == 2
-    (saves / 'link.sav').symlink_to(slot)
+    link = link_in(saves, slot, tmp / 'outside')
     for command in (['backup'], ['check']):
         code, out = run(*opt, *command)
         assert code == 2 and 'Symbolic links' in out, (command, out)
-    (saves / 'link.sav').unlink()
+    link.unlink()
 
 
 def save(body, head=b'EVAS\x01\0\0\0', magic=b'GVAS'):
@@ -289,10 +306,10 @@ with tempfile.TemporaryDirectory() as tmp:
     assert code == 2 and 'partial restore' in out and not marker.exists(), out
 
     # 14. Symbolic links are refused for slot too.
-    (account / 'link.sav').symlink_to(file[0])
+    link = link_in(account, file[0], tmp / 'outside')
     before = tree()
     code, out = run(*opt, 'slot', 0, 4, '--yes')
     assert code == 2 and 'Symbolic links' in out and tree() == before, out
-    (account / 'link.sav').unlink()
+    link.unlink()
 
 print('save_guard_test: ok')

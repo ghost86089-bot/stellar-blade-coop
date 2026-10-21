@@ -18,6 +18,22 @@ For the design, see [how-it-works.md](how-it-works.md).
 The CMake project in `native/` builds one target, `StellarCoop.dll`, with the C++ runtime linked statically, so there
 is no runtime DLL to ship.
 
+### Native Windows
+
+- Visual Studio 2022 Build Tools with the C++ workload (MSVC, Windows SDK, CMake, Ninja) and the C++ Clang tools.
+  `tools/install.py` finds them with `vswhere` and loads `vcvars64.bat` itself; from a Developer prompt it uses that.
+  It then runs the native tests with `clang++` (`STELLAR_CXX` overrides) and builds the DLL with clang-cl, unless
+  `STELLAR_WINDOWS_TOOLCHAIN` names an existing toolchain file.
+- Lua 5.4 as `lua5.4` on the `PATH`, or its full path in `STELLAR_LUA`.
+- Python 3.12 or newer and Git. The tests use directory junctions where Windows refuses symbolic links (no Developer
+  Mode), and the tools refuse junctions wherever they refuse links.
+- `--game` is needed on Windows (the default names a Linux Steam library). The game check uses `tasklist`.
+
+```
+set STELLAR_LUA=%LOCALAPPDATA%\lua-5.4.9\lua5.4.exe
+python tools\install.py --dry-run --game "<Stellar Blade folder>"
+```
+
 ## tools/install.py
 
 `tools/install.py` runs every check, builds the DLL and copies the mod into

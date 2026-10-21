@@ -1123,7 +1123,10 @@ end
 -- No coroutine anywhere in the mod: UE4SS refuses every call made from one (ue4ss() above), and fakes of other
 -- modules may lack that check.
 local scripts=0
-for path in io.popen('ls mod/StellarCoop/Scripts/*.lua'):lines() do
+local windows=package.config:sub(1,1)=='\\' -- cmd.exe has no ls: dir /b lists bare names.
+local listing=windows and 'dir /b mod\\StellarCoop\\Scripts\\*.lua' or 'ls mod/StellarCoop/Scripts/*.lua'
+for name in io.popen(listing):lines() do
+    local path=windows and 'mod/StellarCoop/Scripts/'..name or name
     local file=assert(io.open(path))
     assert(not file:read('a'):find('coroutine%.'),path..' uses a coroutine')
     file:close()

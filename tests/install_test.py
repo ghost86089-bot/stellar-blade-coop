@@ -5,10 +5,11 @@ import contextlib
 import hashlib
 import io
 import re
+import os
 import shutil
-import signal
 import sys
 import tempfile
+import threading
 import time
 import types
 import zipfile
@@ -32,6 +33,29 @@ def run(fn, *args):
         except SystemExit as stop:
             code = stop.code
     return code, out.getvalue()
+
+
+def link_dir(link, target):
+    """link -> target, a folder. Windows without the symlink right (WinError 1314) gets a directory junction, which
+    needs none and which the tool must refuse the same way; a junction needs its target, so a missing one is made for
+    the call and removed again (the junction then dangles, like a link to an unmounted disk)."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, 'winerror', None) != 1314: raise
+        import _winapi
+        made = not target.exists()
+        if made: target.mkdir()
+        _winapi.CreateJunction(str(target), str(link))
+        if made: target.rmdir()
+
+
+def watchdog(seconds):
+    """signal.alarm's job, on Windows too: a hang becomes a failure (the process exits 1). Returns its cancel."""
+    timer = threading.Timer(seconds, os._exit, (1,))
+    timer.daemon = True
+    timer.start()
+    return timer.cancel
 
 
 def uninstall(*extra):
@@ -94,16 +118,16 @@ with tempfile.TemporaryDirectory() as tmp:
     # 3b. A backup folder that is a link to an unmounted disk fails at once, before install or uninstall changes
     # anything. It once looped forever, so the alarm (default action: kill) turns a hang into a failure.
     backups_root, install.BACKUPS = install.BACKUPS, tmp / 'backups-link'
-    install.BACKUPS.symlink_to(tmp / 'unmounted', target_is_directory=True)
+    link_dir(install.BACKUPS, tmp / 'unmounted')
     before = tree()
-    signal.alarm(10)
+    cancel = watchdog(10)
     for call in (lambda: install.install_files(target, v1), lambda: install.uninstall(target, False)):
         try:
             call()
             raise AssertionError('no error')
         except FileExistsError as error:
             assert error.filename == str(install.BACKUPS), error
-    signal.alarm(0)
+    cancel()
     assert tree() == before
     install.BACKUPS.unlink()
     install.BACKUPS = backups_root
@@ -154,7 +178,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert uninstall() == (left_alone, '') and uninstall('--dry-run') == (left_alone, '') and tree() == before
     target.rename(tmp / 'checkout')
     (tmp / 'checkout' / install.MANIFEST).write_bytes(b'main.lua\n')
-    target.symlink_to(tmp / 'checkout', target_is_directory=True)
+    link_dir(target, tmp / 'checkout')
     before = tree()
     assert uninstall() == (left_alone, '') and tree() == before
 

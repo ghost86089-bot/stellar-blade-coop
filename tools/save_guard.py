@@ -10,7 +10,7 @@ import time
 import zlib
 from pathlib import Path
 
-from install import GAME, running_game
+from install import GAME, linked, running_game
 
 PREFIX = Path('/mnt/Jeux/SteamLibrary/steamapps/compatdata/3489700/pfx')
 SAVES = PREFIX / 'drive_c/users/steamuser/AppData/Local/SB/Saved/SaveGames'
@@ -153,7 +153,7 @@ def main(argv=None):
     # Every command: a mistyped --saves or an unmounted drive is refused, never read as "every save removed" or written
     # to; symbolic links are refused, so backup, check and restore all see the same files.
     if not args.saves.is_dir(): fail(f'No save folder at {args.saves}')
-    if any(p.is_symlink() for p in args.saves.rglob('*')): fail(f'Symbolic links in {args.saves}: not touching them')
+    if any(linked(p) for p in args.saves.rglob('*')): fail(f'Symbolic links in {args.saves}: not touching them')
     if args.command == 'backup':
         backup(args.saves, args.to)
         return 0

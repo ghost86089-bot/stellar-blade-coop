@@ -17,6 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GAME = Path('/mnt/Jeux/SteamLibrary/steamapps/common/StellarBlade')
 TOOLCHAIN = os.environ.get('STELLAR_WINDOWS_TOOLCHAIN', str(Path.home() / '.local/share/xwin/clang-cl-msvc.cmake'))
+WINDOWS = os.name == 'nt'  # Native Windows: Visual Studio Build Tools (clang-cl, CMake, Ninja) instead of xwin.
+LUA = os.environ.get('STELLAR_LUA', 'lua5.4')
+CXX = os.environ.get('STELLAR_CXX', 'clang++' if WINDOWS else 'c++')
+EXE = '.exe' if WINDOWS else ''
 MANIFEST = 'install-manifest.txt'
 RUNTIME = ('coop-*.log', 'coop-*.txt', '*.old.log')  # Written by the mod in game: never removed.
 OBSOLETE = {'steam-probe.txt'}  # Left by an old probe, before the manifest existed.
@@ -24,7 +28,16 @@ BACKUPS = Path.home() / 'StellarCoop-install-backups'  # Outside the game folder
 CLOSE_GAME = 'Close Stellar Blade first: its mods must not change under it.'
 
 
+def linked(path):
+    """A symlink, or a Windows directory junction (a folder link anyone can make, which is_symlink does not see)."""
+    return path.is_symlink() or getattr(path, 'is_junction', lambda: False)()
+
+
 def running_game():
+    if WINDOWS:  # No /proc: ask tasklist (a failed query counts as running, so nothing changes under the game).
+        listed = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq SB-Win64-Shipping.exe', '/FO', 'CSV', '/NH'],
+                                capture_output=True, text=True)
+        return listed.returncode != 0 or 'sb-win64-shipping.exe' in listed.stdout.lower()
     for path in Path('/proc').glob('[0-9]*/comm'):
         try:
             if path.read_text().strip().startswith('SB-Win64'): return True
@@ -43,12 +56,26 @@ def version():
         return 'dev'
 
 
+def use_build_tools():
+    """On Windows, loads the Build Tools' vcvars64 into this process (clang++, clang-cl, CMake, Ninja and the MSVC
+    libraries), unless it is already set up. Into os.environ: Windows finds a program on the parent's PATH."""
+    if not WINDOWS or shutil.which('clang-cl'): return
+    vswhere = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Microsoft Visual Studio/Installer/vswhere.exe'
+    found = subprocess.run([vswhere, '-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+                            '-property', 'installationPath'], capture_output=True, text=True) if vswhere.is_file() else None
+    if not found or not found.stdout.strip():
+        sys.exit('No Visual Studio Build Tools with C++ Clang tools found (docs/building.md, Windows)')
+    vcvars = Path(found.stdout.strip()) / 'VC/Auxiliary/Build/vcvars64.bat'
+    out = subprocess.run(f'"{vcvars}" >nul 2>&1 && set', shell=True, capture_output=True, text=True, check=True).stdout
+    os.environ.update(line.split('=', 1) for line in out.splitlines() if '=' in line and not line.startswith('='))
+
+
 def sanitizers():
     """ASan and UBSan flags when this compiler can build and run them here, else none."""
     flags = ['-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
-    exe = ROOT / 'build/host/sanitizer-probe'
+    exe = ROOT / f'build/host/sanitizer-probe{EXE}'
     exe.parent.mkdir(parents=True, exist_ok=True)
-    built = subprocess.run(['c++', *flags, '-x', 'c++', '-', '-o', exe], input=b'int main() {}\n', capture_output=True)
+    built = subprocess.run([CXX, *flags, '-x', 'c++', '-', '-o', exe], input=b'int main() {}\n', capture_output=True)
     if built.returncode == 0 and subprocess.run([exe], capture_output=True).returncode == 0: return flags
     print('Sanitizers: off (this c++ cannot build or run them)', flush=True)
     return []
@@ -110,7 +137,7 @@ def install_files(target, files):
     for rel, data in files.items():
         (target / rel).parent.mkdir(parents=True, exist_ok=True)
         (target / rel).write_bytes(data)
-    (target / MANIFEST).write_text(''.join(f'{rel}\n' for rel in sorted(files)))
+    (target / MANIFEST).write_text(''.join(f'{rel}\n' for rel in sorted(files)), newline='\n')  # LF on Windows too.
     print(f'Installed {len(files)} files into {target}')
 
 
@@ -118,7 +145,7 @@ def uninstall(target, dry_run):
     """Backs up the whole folder (logs and coop-settings.txt included), then removes it. Saves, the slot marker and
     mods.txt are never touched: only a mods.txt line naming the mod is reported."""
     if not target.is_dir(): return print(f'Nothing to uninstall: no StellarCoop folder at {target}')
-    if target.is_symlink() or not (target / MANIFEST).is_file():  # A link may be a checkout: never rmtree it.
+    if linked(target) or not (target / MANIFEST).is_file():  # A link may be a checkout: never rmtree it.
         sys.exit(f'{target} was not installed by this tool (no {MANIFEST}, or a link): left alone')
     rels = sorted(p.relative_to(target).as_posix() for p in target.rglob('*') if p.is_file())
     if dry_run: return print(f'Dry run: would back up {len(rels)} files into {BACKUPS} and remove {target}')
@@ -183,21 +210,24 @@ def main(argv=None):
     if not args.zip and not mods.is_dir(): sys.exit(f'No UE4SS Mods folder at {mods}')
     if args.uninstall: return uninstall(mods / 'StellarCoop', args.dry_run)
     for test in sorted((ROOT / 'tests').glob('*_test.lua')):
-        subprocess.run(['lua5.4', test.relative_to(ROOT)], cwd=ROOT, check=True)  # The game embeds Lua 5.4.
+        subprocess.run([LUA, test.relative_to(ROOT)], cwd=ROOT, check=True)  # The game embeds Lua 5.4.
+    use_build_tools()
     checks = sanitizers()
     for test in sorted((ROOT / 'tests').glob('*_test.py')):
         subprocess.run([sys.executable, test], cwd=ROOT, check=True)
     for test in sorted((ROOT / 'tests').glob('*_test.cpp')):  # Platform-free native code, run on this machine.
-        exe = ROOT / 'build/host' / test.stem
-        subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', *checks, '-I', ROOT / 'native/src', test,
+        exe = ROOT / 'build/host' / f'{test.stem}{EXE}'
+        subprocess.run([CXX, '-std=c++17', '-Wall', '-Wextra', '-Werror', *checks, '-I', ROOT / 'native/src', test,
                         '-o', exe], check=True)
         subprocess.run([exe], check=True)
     ver = version()
     print(f'Version: {ver}', flush=True)
     build = ROOT / 'build/windows'
+    # Native Windows without upstream's xwin toolchain file: clang-cl from the Build Tools' environment.
+    compiler = ['-DCMAKE_CXX_COMPILER=clang-cl'] if WINDOWS and not Path(TOOLCHAIN).is_file() else \
+        [f'-DCMAKE_TOOLCHAIN_FILE={TOOLCHAIN}']
     subprocess.run(['cmake', '-S', ROOT / 'native', '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
-                    f'-DCMAKE_TOOLCHAIN_FILE={TOOLCHAIN}', f'-DSTELLARCOOP_VERSION={ver}'],
-                   check=True, stdout=subprocess.DEVNULL)
+                    *compiler, f'-DSTELLARCOOP_VERSION={ver}'], check=True, stdout=subprocess.DEVNULL)
     subprocess.run(['cmake', '--build', build], check=True)
     files = package(ver, build / 'StellarCoop.dll')
     if args.zip:
