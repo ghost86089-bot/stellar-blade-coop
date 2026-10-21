@@ -9,3 +9,6 @@ add_library(StellarCoop SHARED src/steam_link.cpp src/pose_tick.cpp)
 set_target_properties(StellarCoop PROPERTIES PREFIX "")
 set(STELLARCOOP_VERSION "dev" CACHE STRING "Version baked into the DLL (tools/install.py passes git describe)")
 target_compile_definitions(StellarCoop PRIVATE STELLARCOOP_VERSION="${STELLARCOOP_VERSION}")
+# The bot partner for the test link (loop_steam.h): a test tool, never shipped in the mod's zip.
+add_executable(loop_bot bot/loop_bot.cpp)
+target_include_directories(loop_bot PRIVATE src)

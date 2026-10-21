@@ -21,6 +21,8 @@
 
 #include "clipboard.h"
 #include "link_core.h"
+#include "loop_steam.h"
+#include "loop_udp.h"
 #include "pose_tick.h"
 #include "save_slot.h"
 #include "save_twins.h"
@@ -379,6 +381,38 @@ bool switched_off = false; // coop off: until the game restarts, only coop statu
 std::wstring command_line;
 bool loaded = false, streaming = false; // streaming: the loopback, a recording, a replay or a friend: a pass each 5 ms.
 std::string written;
+// The test link (loop_steam.h): only when STELLARCOOP_LOOP is set, which players never do. Then Steam is never called.
+bool loop_checked = false;
+std::unique_ptr<coop::loop::Steam> loop_steam;
+coop::loop::Udp loop_udp;
+
+// Once, before Steam: the test link if asked for. False when it was asked for but cannot start: the link then stays
+// off rather than falling back to real Steam (a test must never reach the player's friends).
+bool start_loop() {
+  wchar_t value[64] = {};
+  if (!GetEnvironmentVariableW(L"STELLARCOOP_LOOP", value, 64))
+    return true;
+  std::string text, why;
+  for (const wchar_t *c = value; *c; ++c)
+    text += *c < 128 ? static_cast<char>(*c) : '?';
+  bool host = false;
+  uint16_t port = 0;
+  if (!coop::loop::parse_switch(text, host, port) || !loop_udp.open(host, port, why)) {
+    event("TEST LINK refused (STELLARCOOP_LOOP=" + text + "): " + (why.empty() ? "use host:PORT or guest:PORT" : why) +
+          "; the link stays off");
+    write_text(folder + L"coop-status.txt", "missing=test link\n");
+    return false;
+  }
+  loop_steam = std::make_unique<coop::loop::Steam>(host, [](const std::string &d) { loop_udp.send(d); });
+  coop::loop::instance[0] = loop_steam.get();
+  api = coop::loop::api<0>();
+  loaded = true;
+  link = std::make_unique<coop::Link>(api, STELLARCOOP_VERSION, event,
+                                      [](const uint8_t *d, size_t n) { coop::pose::peer_receive(d, n); });
+  event(std::string("TEST LINK on: loopback UDP as ") + (host ? "host" : "guest") + " on 127.0.0.1:" +
+        std::to_string(port) + ", never Steam");
+  return true;
+}
 
 // The co-op saves (save_twins.h): this account's file functions once the SteamID is known, and the requests and
 // passes, against the game as pose_tick.cpp reads it.
@@ -436,7 +470,15 @@ void write_report() {
 // One pass of the worker; false stops it for good.
 bool step() {
   try {
-    HMODULE dll = GetModuleHandleW(L"steam_api64.dll");
+    if (!loaded && !std::exchange(loop_checked, true) && !start_loop())
+      return false;
+    if (loop_steam) { // The test link's datagrams, then its calls, before the link's pass.
+      std::string d;
+      while (loop_udp.receive(d))
+        loop_steam->on_datagram(d);
+      loop_steam->pump(GetTickCount64());
+    }
+    HMODULE dll = loop_steam ? nullptr : GetModuleHandleW(L"steam_api64.dll");
     if (dll && !loaded) {
       std::string missing = coop::load(api, [dll](const char *name) {
         return reinterpret_cast<void *>(GetProcAddress(dll, name));
@@ -564,6 +606,8 @@ bool step() {
       }
       if (ready != coop::Link::Ready::no) {
         uint64_t join = join_requested.exchange(0), session = session_requested.exchange(0);
+        if (loop_steam)
+          session = loop_steam->take_session();
         if (switched_off) // Invites accepted in the overlay and session requests are dropped too.
           join = session = 0;
         link->tick(GetTickCount64(), request, join, session);

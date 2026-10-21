@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""The test link end to end on this PC, without the game: the built loop_bot.exe against itself, then the built
+StellarCoop.dll (loaded by loop_bot dll as the host, asked through coop-request.txt like Lua) against a bot guest. A twin
+points the guest at a port nobody listens on and must fail. Windows only; build first (tools/install.py --dry-run).
+Run: python tools/loop_e2e.py   Prints LOOP E2E: ok and exits 0 only when every check passes."""
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BUILD = Path(__file__).resolve().parent.parent / 'build/windows'
+BOT, DLL = BUILD / 'loop_bot.exe', BUILD / 'StellarCoop.dll'
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def pair(host_args, guest_port, guest_seconds=12):
+    """(host output, guest output), both run at once."""
+    host = subprocess.Popen([BOT, *host_args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    guest = subprocess.run([BOT, 'guest', str(guest_port), str(guest_seconds)], capture_output=True, text=True,
+                           timeout=60)
+    out, _ = host.communicate(timeout=60)
+    return out, guest.stdout + guest.stderr
+
+
+def result(text):
+    found = re.findall(r'^BOT RESULT: (.*)$', text, re.M)
+    assert found, text
+    return found[-1]
+
+
+def main():
+    assert BOT.is_file() and DLL.is_file(), f'build first: {BOT}, {DLL}'
+    # 1. Bot host and bot guest: linked, one chat line and one channel-1 message each way.
+    port = free_port()
+    host, guest = pair(['host', str(port), '12'], port)
+    for side, text in (('host', host), ('guest', guest)):
+        assert result(text) == 'linked=1 said=1 heard=1 binary_in=1', (side, text)
+    # 2. The DLL hosts in its own folder; the bot joins it.
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copy2(DLL, tmp)
+        port = free_port()
+        dll, guest = pair(['dll', tmp, str(port), '25'], port)
+        assert result(dll) == 'dll linked=1', dll
+        assert 'TEST LINK on: loopback UDP as host' in dll and 'never Steam' in dll, dll
+        assert result(guest).startswith('linked=1'), guest
+    # 3. Twin: the guest knocks on a port nobody listens on, so nothing may report linked.
+    host_port, wrong = free_port(), free_port()
+    host, guest = pair(['host', str(host_port), '8'], wrong, 8)
+    assert result(host).startswith('linked=0') and result(guest).startswith('linked=0'), (host, guest)
+    print('LOOP E2E: ok')
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -34,6 +34,19 @@ set STELLAR_LUA=%LOCALAPPDATA%\lua-5.4.9\lua5.4.exe
 python tools\install.py --dry-run --game "<Stellar Blade folder>"
 ```
 
+## The test link (one PC, a bot partner)
+
+`native/src/loop_steam.h` stands in for the Steam API the link uses, for two players on one PC, over loopback UDP
+(`loop_udp.h`). The DLL uses it only when the environment variable `STELLARCOOP_LOOP` is `host:PORT` or `guest:PORT`;
+then it never calls Steam, and a malformed value keeps the link off instead of falling back to Steam. Players never
+set it. Winsock is loaded only then, so the DLL's imports do not change.
+
+`native/bot/loop_bot.cpp` (built next to the DLL as `loop_bot.exe`, never shipped) is the partner: the same
+`link_core.h` on the stand-in. `loop_bot guest PORT` joins a game started with `STELLARCOOP_LOOP=host:PORT`;
+`loop_bot host PORT` hosts; `loop_bot dll FOLDER PORT` loads a built `StellarCoop.dll` as the host without the game.
+`python tools/loop_e2e.py` runs bot against bot, the DLL against a bot, and a twin that must fail
+(`tests/loop_steam_test.cpp` covers the stand-in itself).
+
 ## tools/install.py
 
 `tools/install.py` runs every check, builds the DLL and copies the mod into
