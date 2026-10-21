@@ -107,6 +107,7 @@ int run_dll(const std::string &folder, uint16_t port, uint64_t seconds) {
 } // namespace
 
 int main(int argc, char **argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0); // Every line reaches a redirected file even if a test stops the bot.
   const std::string mode = argc > 1 ? argv[1] : "";
   if ((mode == "guest" || mode == "host") && argc >= 3)
     return run_link(mode == "host", static_cast<uint16_t>(std::atoi(argv[2])),
