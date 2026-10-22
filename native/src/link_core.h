@@ -579,6 +579,7 @@ public:
 
   uint64_t lobby() const { return lobby_; }
   bool host() const { return host_; }
+  uint64_t host_id() const { return host_id_; } // The lobby's host while in one (ourselves when we host), else 0.
   uint32_t build() const { return build_; }
   const std::vector<Peer> &peers() const { return peers_; }
 

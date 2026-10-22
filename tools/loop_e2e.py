@@ -3,12 +3,15 @@
 StellarCoop.dll (loaded by loop_bot dll as the host, asked through coop-request.txt like Lua) against a bot guest. A twin
 points the guest at a port nobody listens on and must fail. Windows only; build first (tools/install.py --dry-run).
 Run: python tools/loop_e2e.py   Prints LOOP E2E: ok and exits 0 only when every check passes."""
+import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 BUILD = Path(__file__).resolve().parent.parent / 'build/windows'
@@ -55,6 +58,25 @@ def main():
         assert result(dll) == 'dll linked=1', dll
         assert 'TEST LINK on: loopback UDP as host' in dll and 'never Steam' in dll, dll
         assert result(guest).startswith('linked=1'), guest
+    # 3b. The host's world: the bot hosts with a save (EVAS, GVAS, CRC-32, 650 KB: 11 chunks), the DLL joins as guest in
+    # a fresh saves folder, asks for it, and must write exactly those bytes into its co-op slot 5 with its record.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        b = b'EVAS\x01\x00\x00\x00GVAS' + os.urandom(650000)
+        world = tmp / 'world.sav'
+        world.write_bytes(b + struct.pack('<I', zlib.crc32(b[8:]) & 0xffffffff))
+        (tmp / 'g').mkdir()
+        shutil.copy2(DLL, tmp / 'g')
+        port = free_port()
+        host = subprocess.Popen([BOT, 'host', str(port), '40', '0', '0', world], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        guest = subprocess.run([BOT, 'dllguest', tmp / 'g', str(port), '40', world], capture_output=True, text=True,
+                               timeout=90)
+        host.kill()
+        host_out, _ = host.communicate(timeout=30)
+        assert 'in 11 chunks' in host_out, host_out
+        assert result(guest.stdout) == 'dll guest linked=1 world_written=1 same_bytes=1 bytes=650016', guest.stdout
+        assert "host's world received: 650016 bytes" in guest.stdout, guest.stdout
     # 3. Twin: the guest knocks on a port nobody listens on, so nothing may report linked.
     host_port, wrong = free_port(), free_port()
     host, guest = pair(['host', str(host_port), '8'], wrong, 8)

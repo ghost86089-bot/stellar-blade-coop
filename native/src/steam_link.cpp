@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "clipboard.h"
+#include "host_world.h"
 #include "link_core.h"
 #include "loop_steam.h"
 #include "loop_udp.h"
@@ -407,6 +408,18 @@ bool switched_off = false; // coop off: until the game restarts, only coop statu
 std::wstring command_line;
 bool loaded = false, streaming = false; // streaming: the loopback, a recording, a replay or a friend: a pass each 5 ms.
 std::string written;
+// Channel 1 from the link: the host's world's messages (host_world.h) are kept for world_pass after the tick, on this
+// worker; everything else is the pose path's.
+std::vector<std::string> world_inbox;
+void channel1(const uint8_t *d, size_t n) {
+  if (n >= 3 && (!std::memcmp(d, "SBQ", 3) || !std::memcmp(d, "SBW", 3))) {
+    if (world_inbox.size() < 2 * coop::world::kMaxChunks)
+      world_inbox.emplace_back(reinterpret_cast<const char *>(d), n);
+    return;
+  }
+  coop::pose::peer_receive(d, n);
+}
+
 // The test link (loop_steam.h): only when STELLARCOOP_LOOP is set, which players never do. Then Steam is never called.
 bool loop_checked = false;
 std::unique_ptr<coop::loop::Steam> loop_steam;
@@ -440,8 +453,7 @@ bool start_loop() {
   coop::loop::instance[0] = loop_steam.get();
   api = coop::loop::api<0>();
   loaded = true;
-  link = std::make_unique<coop::Link>(api, STELLARCOOP_VERSION, event,
-                                      [](const uint8_t *d, size_t n) { coop::pose::peer_receive(d, n); });
+  link = std::make_unique<coop::Link>(api, STELLARCOOP_VERSION, event, channel1);
   link->paks(game_paks.count, game_paks.hash); // As the Steam path does: the .pak check runs on the test link too.
   event(std::string("TEST LINK on: loopback UDP as ") + (host ? "host" : "guest") + " on 127.0.0.1:" +
         std::to_string(port) + ", never Steam");
@@ -452,6 +464,89 @@ bool start_loop() {
 // passes, against the game as pose_tick.cpp reads it.
 std::unique_ptr<WinFs> account;
 coop::twins::Switch coop_saves;
+
+// The host's world (host_world.h, docs/CAMPAIGN.md step 4). A guest asks once a link (and on `coop world`); the host
+// answers with the co-op save its game entered, in chunks; the guest writes it into co-op slot kHostWorldSlot at the
+// title (held until then while a save is loaded), never over her own co-op progress.
+// shortcut: one fixed slot (the fifth); make it a setting once players need another.
+constexpr int kHostWorldSlot = 4;
+coop::world::Sender world_out;
+coop::world::Receiver world_in;
+std::string world_held;      // A whole host's world, waiting for the title.
+uint32_t world_next_id = 1;  // Our requests' numbers.
+bool world_asked_link = false; // This link's automatic request is made.
+
+void ask_world() {
+  const uint32_t id = world_next_id++;
+  world_in.start(id);
+  const std::string q = coop::world::request(id);
+  link->send_binary(reinterpret_cast<const uint8_t *>(q.data()), q.size(), true);
+  event("host's world asked (request " + std::to_string(id) + ")");
+}
+
+// The host's answer: the co-op save its game entered, read whole and checked, then sent in chunks.
+std::string send_world(uint32_t id) {
+  if (saves_state != coop::slot::Saves::coop || slot_index < 0 || slot_index >= coop::twins::kSlots)
+    return "this game has no co-op save loaded (saves=" + std::string(coop::slot::saves_name(saves_state)) + ")";
+  if (!account)
+    return "the account's save folder is not known yet";
+  std::string bytes;
+  const std::string name = coop::twins::twin_name(slot_index);
+  if (const std::string why = coop::world::read_save(*account, name, bytes); !why.empty())
+    return name + " " + why;
+  world_out.start(id, std::move(bytes), uint8_t(slot_index));
+  return {};
+}
+
+// After each tick: the world's messages in, our request once a link, the host's next chunk, the guest's write.
+void world_pass(uint64_t now) {
+  const bool linked = link->linked(), host = link->host();
+  for (std::string &m : std::exchange(world_inbox, {})) {
+    const auto *d = reinterpret_cast<const uint8_t *>(m.data());
+    uint32_t id = 0;
+    coop::world::Chunk c;
+    if (host && coop::world::parse_request(d, m.size(), id)) {
+      const std::string why = send_world(id);
+      event(why.empty() ? "host's world: sending " + coop::twins::twin_name(slot_index) + " in " +
+                              std::to_string(world_out.count()) + " chunks (request " + std::to_string(id) + ")"
+                        : "host's world asked, not sent: " + why);
+      if (!why.empty())
+        link->notice("Your friend asked for your world, but " + why + ".");
+    } else if (!host && coop::world::parse_chunk(d, m.size(), c)) {
+      const auto r = world_in.take(c);
+      if (r == coop::world::Receiver::Result::done) {
+        world_held = world_in.bytes();
+        event("host's world received: " + std::to_string(world_held.size()) + " bytes, the host's slot " +
+              std::to_string(world_in.host_slot()) + ", CRC and the game's check pass");
+      } else if (r == coop::world::Receiver::Result::bad) {
+        event("host's world refused: " + world_in.why());
+        link->notice("The host's world did not arrive whole: " + world_in.why() + ".");
+      }
+    } else {
+      event("host's world: a message ignored (" + std::string(host ? "a chunk sent to the host" : "a request sent "
+                                                                                                  "to a guest") +
+            " or a malformed one)");
+    }
+  }
+  if (!linked) {
+    world_asked_link = false;
+    world_out.stop();
+  } else if (!host && account && !std::exchange(world_asked_link, true)) {
+    ask_world();
+  }
+  if (host && linked)
+    if (const std::string chunk = world_out.next(now); !chunk.empty())
+      link->send_binary(reinterpret_cast<const uint8_t *>(chunk.data()), chunk.size(), true);
+  if (!world_held.empty() && account && !coop::pose::world_loaded()) { // At the title only: no save of ours loaded.
+    const std::string why = coop::world::place(*account, kHostWorldSlot, world_held, link->host_id());
+    const std::string slot = "co-op slot " + std::to_string(kHostWorldSlot + 1);
+    event(why.empty() ? "host's world written to " + coop::twins::twin_name(kHostWorldSlot)
+                      : "host's world not written: " + why);
+    link->notice(why.empty() ? "The host's world is in " + slot + ": load it with Load Game."
+                             : "The host's world was not written: " + why + ".");
+    world_held.clear();
+  }
+}
 struct GameView {
   coop::slot::Saves saves() { return saves_state; }
   std::string why() { return coop::pose::saves_why(); }
@@ -523,8 +618,7 @@ bool step() {
         return false; // Another Steamworks build: never call it.
       }
       loaded = true;
-      link = std::make_unique<coop::Link>(api, STELLARCOOP_VERSION, event,
-                                          [](const uint8_t *d, size_t n) { coop::pose::peer_receive(d, n); });
+      link = std::make_unique<coop::Link>(api, STELLARCOOP_VERSION, event, channel1);
       link->paks(game_paks.count, game_paks.hash);
     }
     if (loaded && !account && !saves_dir.empty() && link->me()) // The game's save folder for this account.
@@ -645,7 +739,16 @@ bool step() {
           session = loop_steam->take_session();
         if (switched_off) // Invites accepted in the overlay and session requests are dropped too.
           join = session = 0;
+        if (request == "world") { // coop world: a guest asks for the host's world again.
+          if (!switched_off && link->linked() && !link->host())
+            ask_world();
+          else
+            event("coop world: only a linked guest asks for the host's world");
+          request.clear();
+        }
         link->tick(GetTickCount64(), request, join, session);
+        if (!switched_off)
+          world_pass(GetTickCount64());
         if (link->take_report())
           write_report();
         if (const std::string code = link->take_copy(); !code.empty()) {

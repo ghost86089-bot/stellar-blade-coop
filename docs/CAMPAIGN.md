@@ -82,6 +82,13 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    Test: the bot scenario above with logs and one in-game screenshot per step.
 4. **Host-world start (decision above).** Save transfer over the link in chunks, a guest co-op slot, load on join.
    Test: two games (game + bot, then two real clients) report the same save digest after join.
+   Built 2026-10-22 (`host_world.h`, wired in `steam_link.cpp`): a guest asks once a link (and on `coop world`); the
+   host sends the co-op save its game entered (`SBW` chunks of 60 KB, 8 a second, CRC-32 over the whole); the guest
+   checks the CRC and the game's own load check and writes it into co-op slot 5 at the title, never over her own co-op
+   progress (backed up first, its manifest line dropped, recorded in `StellarCoopHostWorld.txt`). Verified offline:
+   `host_world_test` (with a twin), and `tools/loop_e2e.py`: the real DLL as guest writes a 650 KB save byte-identical
+   in about 1.3 s. Not yet: the host side in game (its loaded co-op save sent), and loading the slot by itself (today
+   the guest gets a notice to load co-op slot 5 with Load Game).
 5. **Story and world sync, host authoritative.** Map with UE4SS dumps: quest/mission state, world flags, doors, lifts,
    fast travel, camps, cutscene and level-transition triggers. Send each as a host event; the guest applies it or is
    moved to the host. Test per event type, then a chapter played with the bot following the host.

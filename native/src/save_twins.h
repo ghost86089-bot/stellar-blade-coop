@@ -42,6 +42,8 @@ constexpr int kSlots = slot::kSlots;
 constexpr size_t kMaxSave = 64 << 20; // The game's are 2 to 20 MB.
 constexpr size_t kMaxManifest = 4096, kMaxBackups = 64;
 constexpr char kManifest[] = "StellarCoopSaves.txt", kTemp[] = ".coop-tmp";
+// The guest's record of the host's world it wrote into a co-op slot (host_world.h): which slot, and that copy's stat.
+constexpr char kHostWorld[] = "StellarCoopHostWorld.txt";
 
 struct Stat {
   bool exists = false;
@@ -57,7 +59,8 @@ inline bool writable(const std::string &name) {
   for (int n = 0; n < kSlots; ++n)
     if (name == twin_name(n) || name == twin_name(n) + kTemp)
       return true;
-  return name == kManifest || name == std::string(kManifest) + kTemp;
+  return name == kManifest || name == std::string(kManifest) + kTemp || name == kHostWorld ||
+         name == std::string(kHostWorld) + kTemp;
 }
 // The only names written in a backup folder: a StellarBlade*.sav file of the account (ASCII case ignored, as Windows
 // names files), no folder in it.
