@@ -465,16 +465,18 @@ bool start_loop() {
 std::unique_ptr<WinFs> account;
 coop::twins::Switch coop_saves;
 
-// The host's world (host_world.h, docs/CAMPAIGN.md step 4). A guest asks once a link (and on `coop world`); the host
-// answers with the co-op save its game entered, in chunks; the guest writes it into co-op slot kHostWorldSlot at the
-// title (held until then while a save is loaded), never over her own co-op progress.
+// The host's world (host_world.h, docs/CAMPAIGN.md step 4). A guest asks every 10 s until a link brings a world (and
+// on `coop world`); a host in her world answers with the co-op save her game entered, in chunks; the guest writes it
+// into co-op slot kHostWorldSlot at the title (held until then while a save is loaded), never over her own co-op
+// progress.
 // shortcut: one fixed slot (the fifth); make it a setting once players need another.
 constexpr int kHostWorldSlot = 4;
 coop::world::Sender world_out;
 coop::world::Receiver world_in;
 std::string world_held;      // A whole host's world, waiting for the title.
 uint32_t world_next_id = 1;  // Our requests' numbers.
-bool world_asked_link = false; // This link's automatic request is made.
+uint64_t world_ask_at = 0;     // The guest's next request; a host at her title answers none, so it is asked again.
+bool world_got_link = false;   // This link brought a whole world.
 
 void ask_world() {
   const uint32_t id = world_next_id++;
@@ -486,6 +488,8 @@ void ask_world() {
 
 // The host's answer: the co-op save its game entered, read whole and checked, then sent in chunks.
 std::string send_world(uint32_t id) {
+  if (!coop::pose::world_loaded()) // At the title the entered slot is the last session's, not the one she will load.
+    return "this game is still at the title";
   if (saves_state != coop::slot::Saves::coop || slot_index < 0 || slot_index >= coop::twins::kSlots)
     return "this game has no co-op save loaded (saves=" + std::string(coop::slot::saves_name(saves_state)) + ")";
   if (!account)
@@ -510,12 +514,12 @@ void world_pass(uint64_t now) {
       event(why.empty() ? "host's world: sending " + coop::twins::twin_name(slot_index) + " in " +
                               std::to_string(world_out.count()) + " chunks (request " + std::to_string(id) + ")"
                         : "host's world asked, not sent: " + why);
-      if (!why.empty())
+      if (!why.empty() && coop::pose::world_loaded()) // At the title: answered once she loads, no notice.
         link->notice("Your friend asked for your world, but " + why + ".");
     } else if (!host && coop::world::parse_chunk(d, m.size(), c)) {
       const auto r = world_in.take(c);
       if (r == coop::world::Receiver::Result::done) {
-        world_held = world_in.bytes();
+        world_held = world_in.bytes(), world_got_link = true;
         event("host's world received: " + std::to_string(world_held.size()) + " bytes, the host's slot " +
               std::to_string(world_in.host_slot()) + ", CRC and the game's check pass");
       } else if (r == coop::world::Receiver::Result::bad) {
@@ -529,10 +533,12 @@ void world_pass(uint64_t now) {
     }
   }
   if (!linked) {
-    world_asked_link = false;
+    world_ask_at = 0, world_got_link = false;
     world_out.stop();
-  } else if (!host && account && !std::exchange(world_asked_link, true)) {
+  } else if (!host && account && !world_got_link && now >= world_ask_at &&
+             !(world_in.active() && world_in.got() > 0)) { // Never while chunks are arriving.
     ask_world();
+    world_ask_at = now + 10000;
   }
   if (host && linked)
     if (const std::string chunk = world_out.next(now); !chunk.empty())

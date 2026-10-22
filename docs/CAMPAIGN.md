@@ -51,7 +51,9 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Story, quests, cutscenes, area transitions shared | missing | no code; both games run their own story |
 | Doors, lifts, puzzles, fast travel, camps shared | missing | no code |
 | Death and respawn in co-op (survivor fights on, revive) | missing | each game handles its own death; host death only resets the guest's enemy HP |
-| Rejoin after a drop | built (guest rejoins within 60 s); late join with world transfer missing | `link_core_test` |
+| Rejoin after a drop | built (guest rejoins within 60 s) | `link_core_test` |
+| The guest gets the host's world (save transfer) | verified in game both ways on the test link; loading it at join missing | 2026-10-22: game as host sent `StellarBladeCoop00.sav` to the bot, 629,372 bytes byte-identical; game as guest wrote the bot host's world to `StellarBladeCoop04.sav`, byte-identical, with its marker, and again over it on the next run |
+| Hold EVE's death (for revive) | mapped in game, not wired | 2026-10-22: MinimumHP (stat 107) = 1 on her FSBActor holds her at 1 HP, alive, under enemy hits; set back to 0 she dies on the next hit |
 | Loot, inventory, upgrades | per player by design (each keeps her own) | README |
 | Level change, long sessions | not tested | upstream README |
 | Two real PCs on this fork | not tested | needs the second player |
@@ -87,15 +89,24 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    checks the CRC and the game's own load check and writes it into co-op slot 5 at the title, never over her own co-op
    progress (backed up first, its manifest line dropped, recorded in `StellarCoopHostWorld.txt`). Verified offline:
    `host_world_test` (with a twin), and `tools/loop_e2e.py`: the real DLL as guest writes a 650 KB save byte-identical
-   in about 1.3 s. Not yet: the host side in game (its loaded co-op save sent), and loading the slot by itself (today
-   the guest gets a notice to load co-op slot 5 with Load Game).
+   in about 1.3 s.
+   In game 2026-10-22 (test link, bot partner): the game as host sent its co-op save, byte-identical (629,372 bytes);
+   the game as guest wrote the bot host's world into co-op slot 5, byte-identical, and wrote it again over its own
+   earlier copy on the next run. At its title a host's entered slot is the last session's (it read 0 before any
+   load), so a host now answers only once her world is loaded, and a guest asks every 10 s until a world arrives
+   (both in this fork since this run; the second guest run used them).
    Load on join, what is known (2026-10-22): the mod only reads the client's entered slot (+0x54), load slot (+0x868)
    and load mode (+0x86c, 2 = a load, set by the title's Continue and Load Game handlers); `coop saves probe` logs them.
-   Nothing in it starts a load. Next, in game, one session: (a) does Continue pick the newest co-op file (then the
-   guest's Continue already lands in the host's world, which is written last) or the slot played last by another
-   record; (b) if not, find the title's Load Game function for a slot with UE4SS (its widget, WB_LoadGame, and what
-   its slot button calls) and call it from Lua once the host's world is written. Test: the guest's entered slot
-   reads 4 and both games' first save digests after the load match.
+   Nothing in it starts a load. Settled in game 2026-10-22: (a) Continue does not pick slot 5: with the host's world
+   in `StellarBladeCoop04.sav` (the newest file), Continue entered slot 0 and autosaved it. (b) Load Game lists one
+   entry only and it too entered slot 0; slot 5 is not offered anywhere at the title. (That host's world was an older
+   copy of slot 0, so "newest by the save's own time" is not ruled out, but neither menu can be relied on.)
+   Next: a third save set. The switch rewrites the game's 16-character save name in place (`StellarBladeSave` and
+   `StellarBladeCoop`, save_slot.h); `StellarBladeHost` has the same length. The guest writes the host's world to
+   `StellarBladeHost00.sav` and switches to that set at the title, so the game's own Continue (slot 0, the slot it
+   entered last) loads the host's world, its autosaves stay in the host set, and her own co-op progress is never in
+   the way. Test: her entered slot reads 0 with saves=host, `StellarBladeHost00.sav` changes and her
+   `StellarBladeCoop0N.sav` do not.
 5. **Story and world sync, host authoritative.** Map with UE4SS dumps: quest/mission state, world flags, doors, lifts,
    fast travel, camps, cutscene and level-transition triggers. Send each as a host event; the guest applies it or is
    moved to the host. Test per event type, then a chapter played with the bot following the host.
@@ -104,9 +115,16 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    Logic built 2026-10-22 (`revive_core.h`, the owner's Sekiro revive rules): down instead of dead, revived by the
    partner within 1.5 m for 3 s at half HP, the next lethal hit spectates, a camp rest brings a spectator back and
    resets revives, down or spectating with no alive partner is the game's own death, and a `dead` state until the
-   respawn so that both down means both respawn; SBV lines on channel 1. `revive_core_test` with two twins. Not wired
-   into the DLL: it needs, mapped in game, a hold on EVE's death (her HP held at 1, as the shared fight floors
-   enemies), a camp-rest signal, a respawn signal, and hiding a spectator.
+   respawn so that both down means both respawn; SBV lines on channel 1. `revive_core_test` with two twins.
+   Mapped in game 2026-10-22 on the first beach (direct writes from outside, test copy and test save only): her
+   FSBActor is the actor manager's local index as `vitals()` finds it; HP is stat 1 (+0x11C), MinimumHP stat 107
+   (+0x2C4, the stat the shared fight floors enemies with), life +0x2600 (1 alive, 3 dead). With MinimumHP 1 a
+   Naytiba's hits (24 to 41 each) took her from 500 to 16 and then to 1, and she stayed at 1 and alive under further
+   hits; MinimumHP back to 0, the next hit gave HP 0, life 3 and the game's YOU DIED screen, which waits for R
+   ("Revive"); after R: life 1, full HP, the same FSBActor. So: the hold is MinimumHP +1 (in the DLL through ApplyStat
+   type 107 on the logic thread, as the enemy floor), "down" is HP at the floor right after a hit, and "respawned" is
+   life 3 to 1. Still to map: a camp-rest signal, hiding a spectator, and whether a held EVE should stop acting (the
+   enemy kept hitting her at 1 HP).
 7. **Bosses.** Share BossMonster HP, phases and finishers (the guard upstream lacks). Test on the first boss.
 8. **Reconnect and late join.** Rejoin restores the host's world state (step 4's transfer again). Test: kill the bot
    mid-fight, restart it, compare state.

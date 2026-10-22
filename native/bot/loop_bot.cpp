@@ -99,7 +99,8 @@ int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm, int32_t 
   coop::world::Sender world_out;
   coop::world::Receiver world_in; // The guest bot's: with a WORLD_SAVE path, it asks once linked and writes it there.
   int world_requests = 0, world_chunks = 0, world_received = 0;
-  bool world_asked = false;
+  uint32_t world_id_next = 1;
+  uint64_t world_ask_at = 0; // The guest bot asks every 10 s until a world arrives (a host at its title has none yet).
   coop::loop::Udp udp;
   std::string why;
   if (!udp.open(host, port, why))
@@ -155,11 +156,14 @@ int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm, int32_t 
         ++next_seq, next_pose = now + 50;
       }
     }
-    if (!host && !world_file.empty() && link.linked() && !std::exchange(world_asked, true)) {
-      world_in.start(1);
-      const std::string q = coop::world::request(1);
+    if (!host && !world_file.empty() && link.linked() && !world_received && now >= world_ask_at &&
+        !(world_in.active() && world_in.got() > 0)) { // Never while chunks are arriving.
+      const uint32_t id = world_id_next++;
+      world_in.start(id);
+      const std::string q = coop::world::request(id);
       link.send_binary(reinterpret_cast<const uint8_t *>(q.data()), q.size(), true);
-      std::printf("bot: asked for the host's world\n");
+      world_ask_at = now + 10000;
+      std::printf("bot: asked for the host's world (request %u)\n", id);
     }
     for (std::string &m : std::exchange(binary_queue, {})) {
       uint32_t world_id = 0;
