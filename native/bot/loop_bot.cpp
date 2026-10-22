@@ -1,7 +1,10 @@
 // The bot partner for the test link: one StellarCoop link (link_core.h) on the stand-in Steam (loop_steam.h) over
 // loopback UDP, so one game, or no game at all, can be tested against a second player on this PC.
 //
-//   loop_bot guest PORT [SECONDS] [ECHO_CM]  join the host on 127.0.0.1:PORT (the game with STELLARCOOP_LOOP=host:PORT)
+//   loop_bot guest PORT [SECONDS] [ECHO_CM] [HIT_HP]
+//                                            join the host on 127.0.0.1:PORT (the game with STELLARCOOP_LOOP=host:PORT);
+//                                            HIT_HP > 0: also the shared fight's guest (fight_bot.h), a claim of that
+//                                            many HP once a second on an enemy the host announced
 //   loop_bot host PORT [SECONDS]             host, for a second bot or a game with STELLARCOOP_LOOP=guest:PORT
 //   loop_bot dll FOLDER PORT [SECONDS]       load FOLDER\StellarCoop.dll here as the host (STELLARCOOP_LOOP=host:PORT)
 //                                            and ask it to host through coop-request.txt, as Lua does: the DLL's whole
@@ -12,6 +15,7 @@
 // beside its own. The host bot is a pose source for that: one table, then a keyframe every 50 ms, and it checks that
 // each echoed keyframe comes back exactly ECHO_CM away. It prints the link's events and ends with
 // "BOT RESULT: linked=0|1 ..." (exit code 0 only when it was linked).
+#include "fight_bot.h"
 #include "loop_steam.h"
 #include "loop_udp.h"
 #include "pose_echo.h"
@@ -87,7 +91,7 @@ void write_file(const std::string &path, const std::string &text) {
   MoveFileExA((path + ".tmp").c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
-int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm) {
+int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm, int32_t hit_hp) {
   coop::loop::Udp udp;
   std::string why;
   if (!udp.open(host, port, why))
@@ -107,6 +111,8 @@ int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm) {
   std::map<uint32_t, float> sent_x; // The host bot's keyframes: sequence to world X.
   uint32_t next_seq = 1;
   uint64_t next_pose = 0;
+  coop::fight::FightBot fight(hit_hp, 1000);
+  const bool fighting = !host && hit_hp > 0;
   const uint64_t start = GetTickCount64(), end = start + seconds * 1000;
   std::string request = host ? "host" : "";
   uint64_t join_at = start + 500; // The guest asks once the host had a moment to create the lobby.
@@ -156,11 +162,28 @@ int run_link(bool host, uint16_t port, uint64_t seconds, float echo_cm) {
           std::printf("bot: echoing the host's EVE %.0f cm along X\n", echo_cm);
       }
     }
+    if (fighting) { // Channel 2: the host's lines in, our answers and claims out, all reliable.
+      for (const std::string &line : link.take_fight()) {
+        std::printf("bot fight in: %s\n", line.c_str());
+        for (const std::string &reply : fight.receive(line))
+          std::printf("bot fight out: %s\n", reply.c_str()), link.send_fight(reply, true);
+      }
+      for (const std::string &claim : fight.tick(now))
+        std::printf("bot fight out: %s\n", claim.c_str()), link.send_fight(claim, true);
+    } else {
+      link.take_fight(); // Not fighting: nothing keeps them.
+    }
     Sleep(20);
   }
-  std::printf("BOT RESULT: linked=%d said=%d heard=%d binary_in=%llu echoed=%d echo_ok=%d echo_bad=%d\n",
+  const coop::fight::FightBot::Counts &fc = fight.counts();
+  std::printf("BOT RESULT: linked=%d said=%d heard=%d binary_in=%llu echoed=%d echo_ok=%d echo_bad=%d fight_ups=%llu "
+              "fight_hp_lines=%llu fight_hits=%llu fight_confirmed=%llu fight_unconfirmed=%llu fight_deads=%llu "
+              "fight_bad=%llu\n",
               was_linked ? 1 : 0, said ? 1 : 0, heard, static_cast<unsigned long long>(binary_in), echoed, echo_ok,
-              echo_bad);
+              echo_bad, static_cast<unsigned long long>(fc.ups), static_cast<unsigned long long>(fc.hp_lines),
+              static_cast<unsigned long long>(fc.hits), static_cast<unsigned long long>(fc.confirmed),
+              static_cast<unsigned long long>(fc.unconfirmed), static_cast<unsigned long long>(fc.deads),
+              static_cast<unsigned long long>(fc.bad));
   return was_linked ? 0 : 1;
 }
 
@@ -201,7 +224,8 @@ int main(int argc, char **argv) {
   const std::string mode = argc > 1 ? argv[1] : "";
   if ((mode == "guest" || mode == "host") && argc >= 3)
     return run_link(mode == "host", static_cast<uint16_t>(std::atoi(argv[2])),
-                    argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 30, argc > 4 ? float(std::atof(argv[4])) : 150.0f);
+                    argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 30, argc > 4 ? float(std::atof(argv[4])) : 150.0f,
+                    argc > 5 ? std::atoi(argv[5]) : 0);
   if (mode == "dll" && argc >= 4)
     return run_dll(argv[2], static_cast<uint16_t>(std::atoi(argv[3])),
                    argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 30);

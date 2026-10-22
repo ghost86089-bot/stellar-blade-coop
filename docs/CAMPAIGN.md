@@ -33,6 +33,8 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Install and load into the game (UE4SS + mod) | verified | in-game runs 2026-10-21: UE4SS 08a0733 loads, `engine on: pinned build 24463856` |
 | Join and leave a session | verified on the test link; Steam path verified upstream only (two PCs, 2026-10-17) | in-game run: lobby, hello both ways, `peer linked` with the bot; `loop_steam_test`, `link_core_test` |
 | Test with one PC (bot partner) | verified | `STELLARCOOP_LOOP`, `loop_bot`, `tools/loop_e2e.py`, in-game link in 15–18 s |
+| Bot shows as a moving EVE (echo of the host's own, 150 cm along X) | built, verified bot↔bot | `pose_echo_test` against the real codec; 148/148 echoed keyframes exact; not yet seen in game |
+| Bot claims shared-fight hits as a guest | built | `fight_bot_test` against the real `Host`: 4/4 claims taken and confirmed, one kill; not yet run in game |
 | Saves kept apart from the player's real saves during tests | verified | `userdir_probe.ps1`: private LOCALAPPDATA + `-userdir`; real Saved 0 differences in every run |
 | See the partner move (ghost) | built here; verified upstream between two PCs | in game here: poses streamed (~20/s); the bot sends no poses yet, so no ghost was seen |
 | Partner HUD, chat, synced photo mode | built (chat verified bot↔bot) | `tools/loop_e2e.py` chat both ways; HUD not seen in game |
