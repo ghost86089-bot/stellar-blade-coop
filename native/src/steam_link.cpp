@@ -265,6 +265,8 @@ void log_paks() {
 }
 
 // steam_id: 0 until Steam is ready; the marker is then not looked up, as another account's folder never decides.
+std::wstring account_dir(uint64_t steam_id); // Below, once the test link's state is declared.
+
 void watch_saves(uint64_t now_ms, uint64_t steam_id) {
   if (saves_dir.empty() || now_ms < next_save_watch)
     return;
@@ -275,7 +277,7 @@ void watch_saves(uint64_t now_ms, uint64_t steam_id) {
     append(line);
   if (steam_id) {
     bool exists = false;
-    std::string text = coop::pose::read_file(saves_dir + L"\\" + std::to_wstring(steam_id) + L"\\StellarCoopSlot.txt",
+    std::string text = coop::pose::read_file(account_dir(steam_id) + L"\\StellarCoopSlot.txt",
                                              exists, coop::slot::kMaxMarker + 1);
     coop_marker = exists ? coop::slot::marker(text) : coop::slot::kNone;
   }
@@ -410,6 +412,13 @@ bool loop_checked = false;
 std::unique_ptr<coop::loop::Steam> loop_steam;
 coop::loop::Udp loop_udp;
 
+// This account's save folder: SaveGames\<SteamID>, where Steam's build keeps it. On the test link the SteamID is made
+// up, and a test copy started outside Steam keeps its saves at SaveGames' own root, so that root is the account's
+// folder there (seen 2026-10-22: StellarBladeSave00.sav at the root, no SteamID folder).
+std::wstring account_dir(uint64_t steam_id) {
+  return loop_steam ? saves_dir : saves_dir + L"\\" + std::to_wstring(steam_id);
+}
+
 // Once, before Steam: the test link if asked for. False when it was asked for but cannot start: the link then stays
 // off rather than falling back to real Steam (a test must never reach the player's friends).
 bool start_loop() {
@@ -519,7 +528,7 @@ bool step() {
       link->paks(game_paks.count, game_paks.hash);
     }
     if (loaded && !account && !saves_dir.empty() && link->me()) // The game's save folder for this account.
-      account = std::make_unique<WinFs>(saves_dir + L"\\" + std::to_wstring(link->me()), backups_dir);
+      account = std::make_unique<WinFs>(account_dir(link->me()), backups_dir);
     std::string request = take_text(folder + L"coop-request.txt");
     // Taken at every pass, even when it cannot go, so a typed line never stays on disk. Never logged.
     const std::string typed = take_text(folder + L"coop-say.txt");

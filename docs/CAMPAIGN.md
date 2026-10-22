@@ -33,8 +33,11 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Install and load into the game (UE4SS + mod) | verified | in-game runs 2026-10-21: UE4SS 08a0733 loads, `engine on: pinned build 24463856` |
 | Join and leave a session | verified on the test link; Steam path verified upstream only (two PCs, 2026-10-17) | in-game run: lobby, hello both ways, `peer linked` with the bot; `loop_steam_test`, `link_core_test` |
 | Test with one PC (bot partner) | verified | `STELLARCOOP_LOOP`, `loop_bot`, `tools/loop_e2e.py`, in-game link in 15–18 s |
-| Bot shows as a moving EVE (echo of the host's own, 150 cm along X) | built, verified bot↔bot | `pose_echo_test` against the real codec; 148/148 echoed keyframes exact; not yet seen in game |
-| Bot claims shared-fight hits as a guest | built | `fight_bot_test` against the real `Host`: 4/4 claims taken and confirmed, one kill; not yet run in game |
+| Bot shows as a moving EVE (echo of the host's own, 150 cm along X) | verified in game | 2026-10-22: `Ghost ... built: 6 parts (4 leaders)`, `drawn: 4 of 4 leaders`; screenshot of both EVEs walking on the first beach; partner card and "2 m" marker on screen |
+| Chat between the players | verified in game | the bot's "hello from the bot" shown in the game's chat box |
+| Co-op save copies (Convert and play co-op) | verified in game on the test link | `StellarBladeCoop00.sav` made beside the save; Continue loads it (`saves=coop`) |
+| Shared common enemies, host side: the guest's hits change the host's real enemies, a lethal claim kills | verified in game (host side) | 2026-10-22, first beach (Story Mode, scale 135/115): 58 bot claims of 150 HP, 58 confirmed exactly in the host's values, 0 wrong, 0 refused; enemy 494 from 5103 to 3 HP, killed by the lethal claim; host `claims=58 refused=0 kills=1` |
+| Shared common enemies, guest side (her own copies paired and corrected) | built, not tested in game | needs two real games |
 | Saves kept apart from the player's real saves during tests | verified | `userdir_probe.ps1`: private LOCALAPPDATA + `-userdir`; real Saved 0 differences in every run |
 | See the partner move (ghost) | built here; verified upstream between two PCs | in game here: poses streamed (~20/s); the bot sends no poses yet, so no ghost was seen |
 | Partner HUD, chat, synced photo mode | built (chat verified bot↔bot) | `tools/loop_e2e.py` chat both ways; HUD not seen in game |
@@ -70,8 +73,8 @@ Plan below assumes 2; it needs the owner's OK before step 4.
 
 ## Plan, in order (each step ends with a test that can fail)
 
-1. **A save to play on, in the test copy.** New Game in the guarded test copy up to the first fight; save it there
-   (never the owner's saves). Test: the test folder has a `StellarBladeSave00.sav` that loads.
+1. **A save to play on, in the test copy.** Done 2026-10-22: New Game (Story Mode) in the guarded test copy, the
+   game's own autosave at the first beach (`StellarBladeSave00.sav`, test folder only), converted to a co-op copy.
 2. **The bot as a real guest.** The bot replays recorded poses (the host draws its ghost) and runs the shared fight's
    guest side against a fake world mirroring the host's enemies. Test: in game, a shared common enemy pairs, its HP
    changes from the bot's claims, it dies once in both, and the logs agree.
