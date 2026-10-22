@@ -101,6 +101,12 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    moved to the host. Test per event type, then a chapter played with the bot following the host.
 6. **Death and respawn.** A downed player waits while the other fights; respawn at the host's last camp; both down
    resets the area. Test with scripted deaths.
+   Logic built 2026-10-22 (`revive_core.h`, the owner's Sekiro revive rules): down instead of dead, revived by the
+   partner within 1.5 m for 3 s at half HP, the next lethal hit spectates, a camp rest brings a spectator back and
+   resets revives, down or spectating with no alive partner is the game's own death, and a `dead` state until the
+   respawn so that both down means both respawn; SBV lines on channel 1. `revive_core_test` with two twins. Not wired
+   into the DLL: it needs, mapped in game, a hold on EVE's death (her HP held at 1, as the shared fight floors
+   enemies), a camp-rest signal, a respawn signal, and hiding a spectator.
 7. **Bosses.** Share BossMonster HP, phases and finishers (the guard upstream lacks). Test on the first boss.
 8. **Reconnect and late join.** Rejoin restores the host's world state (step 4's transfer again). Test: kill the bot
    mid-fight, restart it, compare state.
