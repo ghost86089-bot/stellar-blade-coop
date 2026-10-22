@@ -89,6 +89,13 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    `host_world_test` (with a twin), and `tools/loop_e2e.py`: the real DLL as guest writes a 650 KB save byte-identical
    in about 1.3 s. Not yet: the host side in game (its loaded co-op save sent), and loading the slot by itself (today
    the guest gets a notice to load co-op slot 5 with Load Game).
+   Load on join, what is known (2026-10-22): the mod only reads the client's entered slot (+0x54), load slot (+0x868)
+   and load mode (+0x86c, 2 = a load, set by the title's Continue and Load Game handlers); `coop saves probe` logs them.
+   Nothing in it starts a load. Next, in game, one session: (a) does Continue pick the newest co-op file (then the
+   guest's Continue already lands in the host's world, which is written last) or the slot played last by another
+   record; (b) if not, find the title's Load Game function for a slot with UE4SS (its widget, WB_LoadGame, and what
+   its slot button calls) and call it from Lua once the host's world is written. Test: the guest's entered slot
+   reads 4 and both games' first save digests after the load match.
 5. **Story and world sync, host authoritative.** Map with UE4SS dumps: quest/mission state, world flags, doors, lifts,
    fast travel, camps, cutscene and level-transition triggers. Send each as a host event; the guest applies it or is
    moved to the host. Test per event type, then a chapter played with the bot following the host.
