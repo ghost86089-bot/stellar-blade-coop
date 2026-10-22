@@ -38,11 +38,15 @@ def result(text):
 
 def main():
     assert BOT.is_file() and DLL.is_file(), f'build first: {BOT}, {DLL}'
-    # 1. Bot host and bot guest: linked, one chat line and one channel-1 message each way.
+    # 1. Bot host and bot guest: linked, one chat line each way, and the guest's echo of the host's poses: every echoed
+    # keyframe back exactly 150 cm along X (the host bot checks), none wrong.
     port = free_port()
     host, guest = pair(['host', str(port), '12'], port)
-    for side, text in (('host', host), ('guest', guest)):
-        assert result(text) == 'linked=1 said=1 heard=1 binary_in=1', (side, text)
+    fields = {side: dict(kv.split('=') for kv in result(text).split()) for side, text in (('host', host), ('guest', guest))}
+    for side in fields:
+        assert (fields[side]['linked'], fields[side]['said'], fields[side]['heard']) == ('1', '1', '1'), (side, fields)
+    assert int(fields['guest']['echoed']) > 10 and int(fields['host']['echo_ok']) > 10, fields
+    assert fields['host']['echo_bad'] == '0', fields
     # 2. The DLL hosts in its own folder; the bot joins it.
     with tempfile.TemporaryDirectory() as tmp:
         shutil.copy2(DLL, tmp)

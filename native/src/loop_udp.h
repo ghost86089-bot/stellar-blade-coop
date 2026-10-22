@@ -5,6 +5,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX // windows.h's min and max macros would break std::min in the headers included after this one.
+#endif
 #include <windows.h>
 #include <winsock2.h>
 
