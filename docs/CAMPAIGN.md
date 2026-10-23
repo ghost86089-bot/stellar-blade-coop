@@ -120,6 +120,20 @@ Plan below assumes 2; it needs the owner's OK before step 4.
 5. **Story and world sync, host authoritative.** Map with UE4SS dumps: quest/mission state, world flags, doors, lifts,
    fast travel, camps, cutscene and level-transition triggers. Send each as a host event; the guest applies it or is
    moved to the host. Test per event type, then a chapter played with the bot following the host.
+   Mapped offline 2026-10-23 (`docs/story.md`, `tools/gvas.py` and `tools/story.py`): the story and world state is in
+   the save, in three structures — quests (`DataMap_SBQuest[Quest]`: states, tasks and their counters, tracking,
+   complete and failed), mission records (`GamePlayProgressRecordData`: a success flag per achievement, trigger and env
+   state, keyed by quest task group) and zones (`DataMap_SBEnv[Env]`: per zone, its env objects — doors, lifts,
+   consoles — with activate/active state/interacted/count, NPCs, triggers, event items and actors, and world objects by
+   their own `UniqueKey`). `tools/story.py` turns those into one sorted `key = value` line per fact (1,502 in the
+   test save; aliases, never array indices), with a SHA-256 digest and a diff, so two saves can be compared in one
+   value and a session's story changes read in one screen. Verified: `story_test.py` (a save written as the game writes
+   it, read back; volatile fields, a reset zone and reordered zones change nothing; a quest state, a task value, a
+   mission flag, an env object and a world object each show as one line), and the test save before and after a walk on
+   the first beach: 236 changed lines over the whole save, 3 of them story (two achievement flags and one effect
+   volume switched on). Not mapped yet, and listed in `docs/story.md`: live unsaved state, which env alias is a door or
+   a lift, cutscenes and level transitions, the enums' other values, and `bZoneReset` (excluded: it flips for every
+   zone that is not the loaded one). Not in game: nothing of this has run against a live game.
 6. **Death and respawn.** A downed player waits while the other fights; respawn at the host's last camp; both down
    resets the area. Test with scripted deaths.
    Logic built 2026-10-22 (`revive_core.h`, the owner's Sekiro revive rules): down instead of dead, revived by the
