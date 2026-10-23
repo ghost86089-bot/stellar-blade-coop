@@ -11,13 +11,11 @@
 // rate limit for one member (kBinaryPerSecond, kBinaryBytesPerSecond) with room for the poses. The guest keeps one
 // transfer, the latest id she asked for, checks the CRC and then the game's own load check, and only then writes.
 //
-// Where it goes (place): one co-op slot of the guest's (save_twins.h's StellarBladeCoop0N.sav), written beside and
-// renamed over as the co-op copies are, read back, and never over the guest's own co-op progress: the slot must be
-// empty, hold an untouched co-op copy (its manifest line matches it: a copy of her own save, which her own save still
-// holds), or hold the host's world this file wrote before (kHostWorld names it and still matches it). What it replaces
-// is backed up first, like the conversion's backup. Its manifest line goes, so the conversion never refreshes it from
-// her own save (save_twins.h: a copy without a line is kept), and kHostWorld records it. Her own saves are never
-// written.
+// Where it goes (place): the guest's host set, StellarBladeHost00-04.sav (save_twins.h's host_name), every one of the
+// five holding it, each written beside and renamed over as the co-op copies are and read back; a failure removes all
+// five, so no slot ever holds an older world next to the new one. These files are the mod's own: her saves and her
+// co-op copies are never written. The guest's game then switches to that set at the title (save_twins.h's to_host):
+// its slot list is her own saves', so Continue and Load Game load whichever slot they pick, of the host's world.
 #pragma once
 
 #include <algorithm>
@@ -188,74 +186,21 @@ template <class Fs> std::string read_save(Fs &fs, const std::string &name, std::
   return why;
 }
 
-// kHostWorld's one line: "<slot> <size> <time> <host SteamID>", the copy's stat right after it was written.
-struct Marker {
-  bool present = false;
-  int slot = -1;
-  twins::Stat copy;
-  uint64_t host = 0;
-};
-inline Marker parse_marker(const std::string &text) {
-  Marker m;
-  std::string f[4], line = text.substr(0, text.find('\n'));
-  if (!line.empty() && line.back() == '\r')
-    line.pop_back();
-  uint64_t v[3];
-  if (text.size() > 512 || !split(line, f, 4, nullptr) || f[0].size() != 1 || f[0][0] < '0' ||
-      f[0][0] >= '0' + twins::kSlots || !number(f[1], v[0]) || !number(f[2], v[1]) || !number(f[3], v[2]))
-    return m;
-  return {true, f[0][0] - '0', {true, v[0], v[1]}, v[2]};
-}
-
-// The host's world into the guest's co-op slot n: empty on success, else why not (nothing of hers changed then, but a
-// backup it made). Fs is save_twins.h's.
-template <class Fs> std::string place(Fs &fs, int n, const std::string &bytes, uint64_t host) {
+// The host's world into the guest's five host files: empty on success, else why not (no host file left then). Fs is
+// save_twins.h's.
+template <class Fs> std::string place(Fs &fs, const std::string &bytes) {
   using namespace twins;
-  if (n < 0 || n >= kSlots)
-    return "no such co-op slot";
   if (bytes.size() > kMaxSave || !game_save(bytes))
     return "the host's save fails the game's own load check";
-  const std::string twin = twin_name(n), temp = twin + kTemp;
-  const Stat now = fs.stat(twin);
-  std::string text;
-  Lines lines;
-  const bool manifest = fs.stat(kManifest).exists && fs.read(kManifest, text, kMaxManifest) && parse(text, lines);
-  const Marker marker = fs.stat(kHostWorld).exists && fs.read(kHostWorld, text, 512) ? parse_marker(text) : Marker();
-  const bool untouched = manifest && lines[n].present && same(now, lines[n].twin);
-  const bool ours = marker.present && marker.slot == n && same(now, marker.copy);
-  if (now.exists && !untouched && !ours)
-    return "co-op slot " + std::to_string(n) + " holds your own co-op progress: not replaced";
-  if (now.exists) { // What it replaces, kept first, read back.
-    std::string old, back;
-    if (!fs.read(twin, old, kMaxSave) || old.size() != now.size)
-      return "co-op slot " + std::to_string(n) + " could not be read for its backup";
-    if (fs.backup_dir().empty() || !fs.backup_write(twin, old) || !fs.backup_read(twin, back, kMaxSave) || back != old)
-      return "the backup of co-op slot " + std::to_string(n) + " could not be made";
-  }
-  if (!writable(temp) || !fs.write(temp, bytes) || !fs.rename(temp, twin)) {
-    if (writable(temp))
-      fs.remove(temp);
-    return "co-op slot " + std::to_string(n) + " could not be written";
-  }
-  std::string back;
-  if (!fs.read(twin, back, kMaxSave) || back != bytes) {
-    fs.remove(twin);
-    return "co-op slot " + std::to_string(n) + " read back different, so it was removed";
-  }
-  // Its line goes: the conversion keeps a copy without one, never refreshing it from her own save.
-  if (manifest && lines[n].present) {
-    lines[n] = Line();
-    const std::string m = std::string(kManifest) + kTemp;
-    if (!fs.write(m, format(lines)) || !fs.rename(m, kManifest))
-      fs.remove(m);
-  }
-  const Stat copy = fs.stat(twin);
-  const std::string k = std::string(kHostWorld) + kTemp;
-  const std::string line = std::to_string(n) + " " + std::to_string(copy.size) + " " + std::to_string(copy.time) + " " +
-                           std::to_string(host) + "\n";
-  if (!fs.write(k, line) || !fs.rename(k, kHostWorld)) {
-    fs.remove(k);
-    return "co-op slot " + std::to_string(n) + " holds the host's world, but its record could not be written";
+  for (int n = 0; n < kSlots; ++n) {
+    const std::string name = host_name(n), temp = name + kTemp;
+    std::string back;
+    if (!writable(temp) || !writable(name) || !fs.write(temp, bytes) || !fs.rename(temp, name) ||
+        !fs.read(name, back, kMaxSave) || back != bytes) {
+      for (int k = 0; k < kSlots; ++k)
+        fs.remove(host_name(k) + kTemp), fs.remove(host_name(k));
+      return host_name(n) + " could not be written";
+    }
   }
   return {};
 }

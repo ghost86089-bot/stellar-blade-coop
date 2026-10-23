@@ -1790,10 +1790,10 @@ slot::Saves saves() {
 }
 std::string saves_why() { return !pinned ? engine_reason : blocked ? std::string("coop off") : names.why(); }
 int load_mode() { return pinned && !blocked ? slot::field(base, rpm, slot::kLoadMode) : slot::kUnread; }
-std::string saves_switch(bool coop) {
+std::string saves_switch(slot::Saves to) {
   if (!pinned || blocked)
     return saves_why();
-  return names.swap(base, rpm, guarded_cas, coop);
+  return names.swap(base, rpm, guarded_cas, to);
 }
 std::string saves_probe() {
   if (!pinned || blocked)

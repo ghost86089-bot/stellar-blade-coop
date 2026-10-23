@@ -42,8 +42,6 @@ constexpr int kSlots = slot::kSlots;
 constexpr size_t kMaxSave = 64 << 20; // The game's are 2 to 20 MB.
 constexpr size_t kMaxManifest = 4096, kMaxBackups = 64;
 constexpr char kManifest[] = "StellarCoopSaves.txt", kTemp[] = ".coop-tmp";
-// The guest's record of the host's world it wrote into a co-op slot (host_world.h): which slot, and that copy's stat.
-constexpr char kHostWorld[] = "StellarCoopHostWorld.txt";
 
 struct Stat {
   bool exists = false;
@@ -53,14 +51,14 @@ inline bool same(const Stat &a, const Stat &b) { return a.exists && b.exists && 
 
 inline std::string main_name(int n) { return "StellarBladeSave0" + std::to_string(n) + ".sav"; }
 inline std::string twin_name(int n) { return "StellarBladeCoop0" + std::to_string(n) + ".sav"; }
+inline std::string host_name(int n) { return "StellarBladeHost0" + std::to_string(n) + ".sav"; } // host_world.h's.
 
 // The only names written, renamed onto or removed in the account's folder.
 inline bool writable(const std::string &name) {
   for (int n = 0; n < kSlots; ++n)
-    if (name == twin_name(n) || name == twin_name(n) + kTemp)
+    if (name == twin_name(n) || name == twin_name(n) + kTemp || name == host_name(n) || name == host_name(n) + kTemp)
       return true;
-  return name == kManifest || name == std::string(kManifest) + kTemp || name == kHostWorld ||
-         name == std::string(kHostWorld) + kTemp;
+  return name == kManifest || name == std::string(kManifest) + kTemp;
 }
 // The only names written in a backup folder: a StellarBlade*.sav file of the account (ASCII case ignored, as Windows
 // names files), no folder in it.
@@ -414,18 +412,21 @@ private:
 // The co-op saves' requests and the worker's passes (AUTO-COOP-SAVE §4.3, §4.5). Game is the caller's view of the game:
 //   slot::Saves saves() (the name as last read back), std::string why() (why it reads off or ?), bool world() (Lua
 //   says a save is loaded), bool title() (Lua says the title screen is shown), int load_mode() (client +0x86c),
-//   std::string swap(bool coop) (save_slot.h's Names::swap, empty once switched).
+//   std::string swap(slot::Saves to) (save_slot.h's Names::swap, empty once switched).
 // saves convert makes the copies; saves coop makes them, then switches the name at the pass's end; saves main switches
 // back, or withdraws the switch a running saves coop pass would make; all at the title only. The title's slot list is
 // the game's, rebuilt from the files only at its own load points (0x141cd4ef0, at StartClient and at each return to the
 // title). The mod never calls that rebuild: it reads and loads every slot on the game thread, and the game follows it
 // with its own UI updates. So once a co-op save was loaded, the title lists the copies, and a switch back would load
-// the player's saves through that list: refused until the game restarts. coop off and a fault never switch back: the
-// name stays until the game exits.
+// the player's saves through that list: refused until the game restarts. The same list is why to_host() works: the
+// guest's Continue and Load Game pick a slot from her own saves' list and load that slot of the host's world (every
+// host file holds it). coop off and a fault never switch back: the name stays until the game exits.
 class Switch {
 public:
   template <class Fs, class Game> std::string ask(SavesAsk what, Fs *fs, Game &game) {
     const slot::Saves now = game.saves();
+    if (now == slot::Saves::host)
+      return "co-op saves refused: the game plays the host's world this launch: restart the game for your own saves";
     if (what == SavesAsk::main && now == slot::Saves::main) { // Withdraws a switch asked for after the pass.
       if (!asked_)
         return "co-op saves are already off: the game uses your own saves";
@@ -444,7 +445,7 @@ public:
     if (what == SavesAsk::main) {
       if (played_)
         return "co-op saves refused: co-op saves were played this launch: restart the game to play your own saves";
-      const std::string why = game.swap(false);
+      const std::string why = game.swap(slot::Saves::main);
       return why.empty() ? "co-op saves off: the game uses your own saves again" : "co-op saves switch failed: " + why;
     }
     if (!fs)
@@ -463,7 +464,7 @@ public:
   // then the switch asked at its end. The lines for the log.
   template <class Fs, class Game> std::vector<std::string> pass(Fs *fs, Game &game, bool off) {
     const slot::Saves now = game.saves();
-    played_ = played_ || (now == slot::Saves::coop && game.world());
+    played_ = played_ || ((now == slot::Saves::coop || now == slot::Saves::host) && game.world());
     std::vector<std::string> lines;
     if (!fs || !convert_.busy())
       return lines;
@@ -484,7 +485,7 @@ public:
       lines.push_back("co-op saves stay off: " + convert_.error());
     else if (why = slot::not_title(game.world(), game.title(), game.load_mode()); !why.empty())
       lines.push_back("co-op saves refused: " + why);
-    else if (why = game.swap(true); !why.empty())
+    else if (why = game.swap(slot::Saves::coop); !why.empty())
       lines.push_back("co-op saves switch failed: " + why);
     else
       lines.push_back("co-op saves on: the game now uses StellarBladeCoop00.sav to 04.sav; your own saves are not "
@@ -492,12 +493,28 @@ public:
     return lines;
   }
 
+  // The switch to the host's world (host_world.h, once it is written), the caller having checked the title: empty once
+  // the game uses it, else why not. Whatever the title's list holds (her saves', or her copies' once one was played),
+  // every host file is the host's world; refused only while a conversion runs (it reads the name it started on).
+  template <class Game> std::string to_host(Game &game) {
+    const slot::Saves now = game.saves();
+    if (now == slot::Saves::host)
+      return {};
+    if (now != slot::Saves::main && now != slot::Saves::coop)
+      return std::string("the save name reads ") + slot::saves_name(now) + (game.why().empty() ? "" : ": " + game.why());
+    if (std::string why = slot::not_title(game.world(), game.title(), game.load_mode()); !why.empty())
+      return why;
+    if (convert_.busy())
+      return "a co-op saves conversion is under way";
+    return game.swap(slot::Saves::host);
+  }
+
   std::string status() const { return "convert=" + convert_.status(); }
 
 private:
   Convert convert_;
   bool asked_ = false;  // saves coop: switch at the end of the pass.
-  bool played_ = false; // A save was loaded while the name was the co-op one.
+  bool played_ = false; // A save was loaded while the name was a co-op set (the copies or the host's world).
 };
 
 } // namespace coop::twins

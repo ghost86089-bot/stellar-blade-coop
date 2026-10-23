@@ -465,18 +465,30 @@ bool start_loop() {
 std::unique_ptr<WinFs> account;
 coop::twins::Switch coop_saves;
 
+struct GameView {
+  coop::slot::Saves saves() { return saves_state; }
+  std::string why() { return coop::pose::saves_why(); }
+  bool world() { return coop::pose::world_loaded(); }
+  bool title() { return coop::pose::lua_state().title; }
+  int load_mode() { return coop::pose::load_mode(); }
+  std::string swap(coop::slot::Saves to) {
+    std::string why = coop::pose::saves_switch(to);
+    saves_state = coop::pose::saves(); // The status shows the switch at once.
+    return why;
+  }
+};
+
 // The host's world (host_world.h, docs/CAMPAIGN.md step 4). A guest asks every 10 s until a link brings a world (and
-// on `coop world`); a host in her world answers with the co-op save her game entered, in chunks; the guest writes it
-// into co-op slot kHostWorldSlot at the title (held until then while a save is loaded), never over her own co-op
-// progress.
-// shortcut: one fixed slot (the fifth); make it a setting once players need another.
-constexpr int kHostWorldSlot = 4;
+// on `coop world`); a host in her world answers with the save her game entered, in chunks; the guest writes it into
+// her host set (StellarBladeHost00-04.sav) with no save of hers loaded, then switches the game to that set at the
+// title, so its own Continue loads the host's world.
 coop::world::Sender world_out;
 coop::world::Receiver world_in;
 std::string world_held;      // A whole host's world, waiting for the title.
 uint32_t world_next_id = 1;  // Our requests' numbers.
 uint64_t world_ask_at = 0;     // The guest's next request; a host at her title answers none, so it is asked again.
 bool world_got_link = false;   // This link brought a whole world.
+bool world_switch = false;     // The host set is written: switch to it at the title.
 
 void ask_world() {
   const uint32_t id = world_next_id++;
@@ -486,16 +498,23 @@ void ask_world() {
   event("host's world asked (request " + std::to_string(id) + ")");
 }
 
+// The save her game entered: a co-op copy, or the host's world she plays as a guest-turned-host.
+std::string world_name() {
+  return saves_state == coop::slot::Saves::host ? coop::twins::host_name(slot_index)
+                                                : coop::twins::twin_name(slot_index);
+}
+
 // The host's answer: the co-op save its game entered, read whole and checked, then sent in chunks.
 std::string send_world(uint32_t id) {
   if (!coop::pose::world_loaded()) // At the title the entered slot is the last session's, not the one she will load.
     return "this game is still at the title";
-  if (saves_state != coop::slot::Saves::coop || slot_index < 0 || slot_index >= coop::twins::kSlots)
+  if ((saves_state != coop::slot::Saves::coop && saves_state != coop::slot::Saves::host) || slot_index < 0 ||
+      slot_index >= coop::twins::kSlots)
     return "this game has no co-op save loaded (saves=" + std::string(coop::slot::saves_name(saves_state)) + ")";
   if (!account)
     return "the account's save folder is not known yet";
   std::string bytes;
-  const std::string name = coop::twins::twin_name(slot_index);
+  const std::string name = world_name();
   if (const std::string why = coop::world::read_save(*account, name, bytes); !why.empty())
     return name + " " + why;
   world_out.start(id, std::move(bytes), uint8_t(slot_index));
@@ -511,7 +530,7 @@ void world_pass(uint64_t now) {
     coop::world::Chunk c;
     if (host && coop::world::parse_request(d, m.size(), id)) {
       const std::string why = send_world(id);
-      event(why.empty() ? "host's world: sending " + coop::twins::twin_name(slot_index) + " in " +
+      event(why.empty() ? "host's world: sending " + world_name() + " in " +
                               std::to_string(world_out.count()) + " chunks (request " + std::to_string(id) + ")"
                         : "host's world asked, not sent: " + why);
       if (!why.empty() && coop::pose::world_loaded()) // At the title: answered once she loads, no notice.
@@ -543,28 +562,28 @@ void world_pass(uint64_t now) {
   if (host && linked)
     if (const std::string chunk = world_out.next(now); !chunk.empty())
       link->send_binary(reinterpret_cast<const uint8_t *>(chunk.data()), chunk.size(), true);
-  if (!world_held.empty() && account && !coop::pose::world_loaded()) { // At the title only: no save of ours loaded.
-    const std::string why = coop::world::place(*account, kHostWorldSlot, world_held, link->host_id());
-    const std::string slot = "co-op slot " + std::to_string(kHostWorldSlot + 1);
-    event(why.empty() ? "host's world written to " + coop::twins::twin_name(kHostWorldSlot)
+  GameView game;
+  const std::string title = coop::slot::not_title(game.world(), game.title(), game.load_mode());
+  // No save of ours loaded; and while the game already uses the host set, at the title only (a load may be reading it).
+  if (!world_held.empty() && account && !game.world() && (saves_state != coop::slot::Saves::host || title.empty())) {
+    const std::string why = coop::world::place(*account, world_held);
+    event(why.empty() ? "host's world written to " + coop::twins::host_name(0) + " to 04"
                       : "host's world not written: " + why);
-    link->notice(why.empty() ? "The host's world is in " + slot + ": load it with Load Game."
-                             : "The host's world was not written: " + why + ".");
+    if (!why.empty())
+      link->notice("The host's world was not written: " + why + ".");
+    world_switch = why.empty();
     world_held.clear();
   }
-}
-struct GameView {
-  coop::slot::Saves saves() { return saves_state; }
-  std::string why() { return coop::pose::saves_why(); }
-  bool world() { return coop::pose::world_loaded(); }
-  bool title() { return coop::pose::lua_state().title; }
-  int load_mode() { return coop::pose::load_mode(); }
-  std::string swap(bool coop) {
-    std::string why = coop::pose::saves_switch(coop);
-    saves_state = coop::pose::saves(); // The status shows the switch at once.
-    return why;
+  if (world_switch && title.empty()) {
+    world_switch = false;
+    const std::string why = coop_saves.to_host(game);
+    event(why.empty() ? "host's world: the game now uses StellarBladeHost00-04.sav"
+                      : "host's world not switched to: " + why);
+    link->notice(why.empty() ? "The host's world is ready: press Continue to join it. Restart the game to play your own "
+                               "saves again."
+                             : "The host's world arrived, but " + why + ".");
   }
-};
+}
 
 std::string status_text() {
   std::string head = link ? link->status(coop::Counters{cb333.load(), cb505.load(), cb1251.load()})

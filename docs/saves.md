@@ -26,9 +26,13 @@ The step-by-step procedures for players are in [INSTALL.md](../INSTALL.md#saves-
 - On the pinned game build only, and until `coop off`, the mod reads which slot the game entered (every 250 ms), for
   the `slot=` line of `coop status`.
 
+- As a guest, the native part writes the host's world it received into `StellarBladeHost00.sav` to `04.sav`, all five
+  holding the same save, with no save of yours loaded, then switches the game's save file name to `StellarBladeHost` at
+  the title (see [The host's world](#the-hosts-world)).
+
 Apart from a restore, which puts a backup back, the only saves anything in this project writes are copies: the co-op
-save copies above, and the manual co-op slot, which `tools/save_guard.py slot` makes with the game closed and after a
-safety backup. Nothing is copied back from either.
+save copies above, the host's world, and the manual co-op slot, which `tools/save_guard.py slot` makes with the game
+closed and after a safety backup. Nothing is copied back from any of them.
 
 ## Where the saves are
 
@@ -121,12 +125,23 @@ To check, `coop status` (or the `[StellarCoop] link: slot=...` line in `UE4SS.lo
 | Line | Meaning |
 | --- | --- |
 | `slot=coop index=2 marker=none saves=coop` | A co-op copy is loaded (here `StellarBladeCoop02.sav`) |
+| `slot=coop index=0 marker=none saves=host` | The host's world is loaded (here `StellarBladeHost00.sav`) |
 | `slot=main index=0 marker=none saves=main` | One of your own saves is loaded (here file 00) |
 | `slot=none ... saves=coop` | No save is loaded yet (the title screen); the game uses the copies |
 | `saves=off` | The mod cannot read the save file name (another game build, or a check failed): no copies, no question |
 | `slot=unknown`, `index=?` or `saves=?` | Not read yet, another game build, or after `coop off` |
 
 The `convert=` line gives the last copy pass: `idle`, `busy <done>/<jobs>`, `done` or `error:<why>`.
+
+### The host's world
+
+When you join a friend's game, your game asks for the save the host plays and checks it (its CRC-32 and the game's own
+check). With no save of yours loaded, it writes it into `StellarBladeHost00.sav` to `04.sav`, all five the same, then
+switches the game's save file name to `StellarBladeHost` at the title. The notice says `The host's world is ready:
+press Continue to join it.` Continue (or any slot in Load Game) then loads the host's world, and the game's own saves
+during the session go into those files. Your own saves and co-op copies are not written. Until the game restarts,
+`coop saves` requests are refused; restart the game to play your own saves again. The next join writes the host files
+again, over what was played there.
 
 ### Manual co-op slot
 

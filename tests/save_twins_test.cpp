@@ -4,8 +4,8 @@
 // played copies never replaced, a missing or bad manifest keeping everything, a torn read retried once, a failed write,
 // rename or read-back leaving no half copy, a pass stopped half way keeping its copies untouched, and the requests'
 // refusals (off the title included, before and during a pass), the switch at the end of a pass, its withdrawal and its
-// release, against a fake game. The player's own saves are compared byte for byte, with their write times, after every
-// pass.
+// release, and the switch to the host's world, against a fake game. The player's own saves are compared byte for byte,
+// with their write times, after every pass.
 #include "save_twins.h"
 
 #include <cassert>
@@ -138,11 +138,11 @@ struct Game {
   bool world() const { return loaded; }
   bool title() const { return at_title; }
   int load_mode() const { return mode; }
-  std::string swap(bool coop) {
+  std::string swap(Saves to) {
     ++swaps;
     if (swap_fails)
       return "the save name could not be written";
-    name = coop ? Saves::coop : Saves::main;
+    name = to;
     return {};
   }
 };
@@ -563,6 +563,29 @@ int main() {
          "co-op saves refused: co-op saves were played this launch: restart the game to play your own saves");
   passes(sw, f, game, true);
   assert(game.name == Saves::coop && game.swaps == 5);
+  // The host's world (host_world.h wrote every host file): even after a co-op save was played, the switch to it at the
+  // title, once; then every co-op saves request is refused until the game restarts.
+  assert(sw.to_host(game).empty() && game.name == Saves::host && game.swaps == 6);
+  assert(sw.to_host(game).empty() && game.swaps == 6);
+  for (SavesAsk what : {SavesAsk::main, SavesAsk::coop, SavesAsk::convert})
+    assert(sw.ask(what, &f, game) ==
+           "co-op saves refused: the game plays the host's world this launch: restart the game for your own saves");
+  assert(game.name == Saves::host && game.swaps == 6);
+  // Refused: off the title, a name none of ours, a conversion running (it reads the name it started on).
+  Switch sw_host;
+  Game game_host;
+  game_host.loaded = true;
+  assert(sw_host.to_host(game_host) == "a save is loaded: quit to the title first");
+  game_host.loaded = false, game_host.mode = 2;
+  assert(sw_host.to_host(game_host) == "Continue or Load Game was chosen at the title (load mode 2)");
+  game_host.mode = 0, game_host.name = Saves::off;
+  assert(sw_host.to_host(game_host) == "the save name reads off: no GameSaveFileName entry");
+  game_host.name = Saves::main;
+  spill(f.dir / "StellarBladeSave01.sav", save("one, again")); // A refresh to make: the pass is busy.
+  assert(sw_host.ask(SavesAsk::convert, &f, game_host).rfind("co-op saves: converting", 0) == 0);
+  assert(sw_host.to_host(game_host) == "a co-op saves conversion is under way" && game_host.swaps == 0);
+  passes(sw_host, f, game_host);
+  assert(sw_host.to_host(game_host).empty() && game_host.name == Saves::host && game_host.swaps == 1);
   // A pass that cannot end ready never switches; a load or coop off during a pass stops it, and nothing switches.
   Switch sw2;
   Game game2;

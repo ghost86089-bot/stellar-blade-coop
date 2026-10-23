@@ -62,10 +62,10 @@ std::string saves_why();
 // Worker thread: the title's load mode (client +0x86c, save_slot.h's not_title), or slot::kUnread on another build or
 // after coop off.
 int load_mode();
-// Worker thread: switches the save name to the co-op copies' (coop) or back (save_slot.h's Names::swap: one 8-byte
+// Worker thread: switches the save name to another set (main, coop or host: save_slot.h's Names::swap, one 8-byte
 // compare-and-swap in the game's heap, under SEH). Empty once switched, else why not. On the pinned build, before coop
 // off only; the caller checks the title first.
-std::string saves_switch(bool coop);
+std::string saves_switch(slot::Saves to);
 // Worker thread, Phase 11's shared fight (fight_engine.h's Worker). A coop fight request (Command::fight): on, probe,
 // record or replay with the charIds it shares (fight_chars; none: every Monster), off, status or a probe's test;
 // marker: the slot StellarCoopSlot.txt names. A mode starts only on the pinned build and before coop off, else is

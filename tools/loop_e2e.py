@@ -59,7 +59,7 @@ def main():
         assert 'TEST LINK on: loopback UDP as host' in dll and 'never Steam' in dll, dll
         assert result(guest).startswith('linked=1'), guest
     # 3b. The host's world: the bot hosts with a save (EVAS, GVAS, CRC-32, 650 KB: 11 chunks), the DLL joins as guest in
-    # a fresh saves folder, asks for it, and must write exactly those bytes into its co-op slot 5 with its record.
+    # a fresh saves folder, asks for it, and must write exactly those bytes into all five of its host files.
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         b = b'EVAS\x01\x00\x00\x00GVAS' + os.urandom(650000)

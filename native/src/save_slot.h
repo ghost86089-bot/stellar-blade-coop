@@ -5,9 +5,10 @@
 //
 // The co-op saves (AUTO-COOP-SAVE): every slot file name starts with the GameSaveFileName string of SB's constant
 // table, which the name builder (0x141cf7310) copies at each call. find() walks the table the builder's way to that
-// string through the same read function; its last four characters, "Save" or "Coop", say which files the game uses:
-// StellarBladeSave00-04.sav (the player's own) or StellarBladeCoop00-04.sav (the co-op copies, save_twins.h). Names
-// keeps what was found and latches when the entry moves.
+// string through the same read function; its last four characters, "Save", "Coop" or "Host", say which files the game
+// uses: StellarBladeSave00-04.sav (the player's own), StellarBladeCoop00-04.sav (the co-op copies, save_twins.h) or
+// StellarBladeHost00-04.sav (the host's world a guest plays, host_world.h). Names keeps what was found and latches when
+// the entry moves.
 #pragma once
 
 #include <climits>
@@ -53,14 +54,22 @@ constexpr uint64_t kKeyCache = 0x1471035ac; // The builder's cached key: 0 until
 constexpr uint32_t kNameKey = 0xbb9194f2;   // UE4's Strihash_DEPRECATED of "GameSaveFileName".
 constexpr uint32_t kMaxNames = 4096;        // SB's table holds about 200 constants; more is not its table.
 constexpr int32_t kNameChars = 17;          // "StellarBladeSave" and its NUL, as the FString counts them.
-// The name's last four characters as one little-endian word at its characters + 24: L"Save" and L"Coop".
-constexpr uint64_t kSave = 0x0065007600610053, kCoop = 0x0070006f006f0043;
+// The name's last four characters as one little-endian word at its characters + 24: L"Save", L"Coop" and L"Host".
+constexpr uint64_t kSave = 0x0065007600610053, kCoop = 0x0070006f006f0043, kHost = 0x00740073006f0048;
 
-// Which save files the game uses: not read yet (or no table yet), the player's own, the co-op copies, or none of ours
-// (another build, coop off, or a check failed).
-enum class Saves { unread, main, coop, off };
+// Which save files the game uses: not read yet (or no table yet), the player's own, the co-op copies, the host's world,
+// or none of ours (another build, coop off, or a check failed).
+enum class Saves { unread, main, coop, off, host };
 inline const char *saves_name(Saves s) {
-  return s == Saves::main ? "main" : s == Saves::coop ? "coop" : s == Saves::off ? "off" : "?";
+  return s == Saves::main   ? "main"
+         : s == Saves::coop ? "coop"
+         : s == Saves::host ? "host"
+         : s == Saves::off  ? "off"
+                            : "?";
+}
+// A set's last four characters as their word, or 0 for none.
+inline uint64_t word(Saves s) {
+  return s == Saves::main ? kSave : s == Saves::coop ? kCoop : s == Saves::host ? kHost : 0;
 }
 
 // One walk: the verdict, why it is off or unread, and what was read on the way (for the probe).
@@ -76,8 +85,9 @@ struct Name {
 // array's elements at +0xf8 (0x20 bytes each: key +0, FString +8 {characters, count +0x10}, next index in the bucket's
 // chain +0x18), the array's count +0x100 and free count +0x12c, its buckets at +0x138 (inline at +0x130 when there is
 // one bucket) and their count +0x140. Two independent facts make it ours: the key, and 17 characters reading
-// "StellarBladeSave" or "StellarBladeCoop" with their NUL, 8-aligned so their last four are one word. Every count is
-// checked before it is used and every chain ends within the array's count. Six reads when the table is SB's.
+// "StellarBladeSave", "StellarBladeCoop" or "StellarBladeHost" with their NUL, 8-aligned so their last four are one
+// word. Every count is checked before it is used and every chain ends within the array's count. Six reads when the
+// table is SB's.
 template <class Read> Name find(uint64_t base, Read &&read) {
   Name n;
   auto off = [&n](const char *why) {
@@ -137,8 +147,10 @@ template <class Read> Name find(uint64_t base, Read &&read) {
       n.saves = Saves::main;
     else if (!std::memcmp(chars, u"StellarBladeCoop", sizeof chars))
       n.saves = Saves::coop;
+    else if (!std::memcmp(chars, u"StellarBladeHost", sizeof chars))
+      n.saves = Saves::host;
     else
-      return off("the name is neither StellarBladeSave nor StellarBladeCoop");
+      return off("the name is none of StellarBladeSave, StellarBladeCoop and StellarBladeHost");
     return n;
   }
   return off("no GameSaveFileName entry");
@@ -152,7 +164,7 @@ public:
   Saves update(const Name &n) {
     if (latched_)
       return saves_;
-    const bool ours = n.saves == Saves::main || n.saves == Saves::coop;
+    const bool ours = word(n.saves) != 0;
     if (ours && (!tail_ || tail_ == n.data + 24)) {
       tail_ = n.data + 24;
       why_.clear();
@@ -163,15 +175,15 @@ public:
     why_ = n.why;
     return saves_ = n.saves;
   }
-  // The switch: the name read again, one compare-and-swap of its last four characters (cas(address, expected,
-  // desired) is true only when it swapped; on the worker, under SEH), then the name read back. Empty once the name
-  // reads the asked one; else why not. A failed swap or read-back latches: no switch again this run. A read-back that
-  // fails after the swap says the name was written, since the game may use the other files from then on.
-  template <class Read, class Cas> std::string swap(uint64_t base, Read &&read, Cas &&cas, bool coop) {
-    const Saves from = coop ? Saves::main : Saves::coop, to = coop ? Saves::coop : Saves::main;
-    if (update(find(base, read)) != from)
+  // The switch to another set: the name read again, one compare-and-swap of its last four characters (cas(address,
+  // expected, desired) is true only when it swapped; on the worker, under SEH), then the name read back. Empty once the
+  // name reads the asked one; else why not. A failed swap or read-back latches: no switch again this run. A read-back
+  // that fails after the swap says the name was written, since the game may use the other files from then on.
+  template <class Read, class Cas> std::string swap(uint64_t base, Read &&read, Cas &&cas, Saves to) {
+    const Saves from = update(find(base, read));
+    if (!word(from) || !word(to) || from == to)
       return std::string("the save name reads ") + saves_name(saves_) + (why_.empty() ? "" : ": " + why_);
-    if (!cas(tail_, coop ? kSave : kCoop, coop ? kCoop : kSave)) {
+    if (!cas(tail_, word(from), word(to))) {
       latch("the save name could not be written");
       return why_;
     }
@@ -285,13 +297,13 @@ inline int marker(const std::string &text) {
   return lines == 1 ? slot : kBad;
 }
 
-// "slot=<coop|main|none|unknown> index=<n|?> marker=<n|none|bad|?> saves=<coop|main|off|?>", no '\n'. The first rule
-// that applies: unknown while the name, the index or (unless the name is the co-op one) the marker is unread; none
+// "slot=<coop|main|none|unknown> index=<n|?> marker=<n|none|bad|?> saves=<coop|host|main|off|?>", no '\n'. The first
+// rule that applies: unknown while the name, the index or (unless the name is the co-op one) the marker is unread; none
 // without a loaded save (the title, a map load); unknown for an index outside 0-4 (before it is compared, so -1 never
-// equals kNone); coop on the co-op saves, the marker then ignored; coop when the marker names the entered slot (the
-// legacy slot, on the player's own saves or with co-op saves off); main otherwise.
+// equals kNone); coop on the co-op saves or the host's world, the marker then ignored; coop when the marker names the
+// entered slot (the legacy slot, on the player's own saves or with co-op saves off); main otherwise.
 inline std::string line(int index, int marker, bool world, Saves saves) {
-  const bool named = saves == Saves::coop;
+  const bool named = saves == Saves::coop || saves == Saves::host;
   const char *verdict = saves == Saves::unread || index == kUnread || (!named && marker == kNotRead) ? "unknown"
                         : !world                                                                    ? "none"
                         : index < 0 || index >= kSlots                                              ? "unknown"

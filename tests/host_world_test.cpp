@@ -1,9 +1,8 @@
 // The host's world for the guest (host_world.h): the request and chunk messages and their refusals, a transfer
 // reassembled in any order with duplicates, chunks that disagree, a whole that fails its CRC or the game's own check,
-// the sender's pacing; and place() on an in-memory account folder that enforces save_twins.h's name check: an empty
-// slot, an untouched co-op copy (backed up, replaced, its manifest line gone, the other lines kept), the guest's own
-// co-op progress (refused, nothing changed), the host's world written before (replaced), and a save that fails the
-// game's check (refused). Her own saves are never written.
+// the sender's pacing; and place() on an in-memory account folder that enforces save_twins.h's name check: all five
+// host files written (and again on a later join), her saves and co-op copies untouched, a write failing half way
+// leaving no host file at all, and a save that fails the game's check refused before any write.
 #include "host_world.h"
 
 #include <cassert>
@@ -43,6 +42,7 @@ struct MemFs {
   uint64_t clock = 1000;
   std::vector<std::string> writes;
   int backups_made = 0;
+  std::string fail_rename; // A rename onto this name fails, as a full or locked disk does.
   twins::Stat stat(const std::string &n) {
     auto it = files.find(n);
     return it == files.end() ? twins::Stat{} : twins::Stat{true, it->second.size(), times[n]};
@@ -62,6 +62,8 @@ struct MemFs {
   }
   bool rename(const std::string &from, const std::string &to) {
     assert(twins::writable(from) && twins::writable(to) && files.count(from));
+    if (to == fail_rename)
+      return false;
     files[to] = files[from], times[to] = times[from];
     files.erase(from);
     return true;
@@ -167,48 +169,38 @@ int main() {
     assert(r.bytes() == host && r.host_slot() == 4 && s.next(10000).empty());
   }
 
-  // ---- place(): where the host's world may go ----
+  // ---- place(): the host's world into the guest's five host files ----
   const std::string world = save("the host's world"), mine = save("my own save"), progress = save("my co-op progress");
   {
-    MemFs fs; // An empty slot 2, her own save in 0: written, recorded; her save untouched.
-    fs.files["StellarBladeSave00.sav"] = mine, fs.times["StellarBladeSave00.sav"] = 1;
-    assert(place(fs, 2, world, 7656) == "");
-    assert(fs.files["StellarBladeCoop02.sav"] == world && fs.files["StellarBladeSave00.sav"] == mine);
-    const Marker m = parse_marker(fs.files[twins::kHostWorld]);
-    assert(m.present && m.slot == 2 && m.host == 7656 && twins::same(m.copy, fs.stat("StellarBladeCoop02.sav")));
-    assert(fs.backups_made == 0 && !fs.files.count("StellarBladeCoop02.sav.coop-tmp"));
-
-    // Again, over the host's world it wrote: replaced (backed up first).
+    MemFs fs; // Her own save and her co-op progress beside: every host file holds the world, hers untouched.
+    fs.files["StellarBladeSave00.sav"] = mine, fs.files["StellarBladeCoop00.sav"] = progress;
+    assert(place(fs, world) == "");
+    for (int n = 0; n < twins::kSlots; ++n)
+      assert(fs.files[twins::host_name(n)] == world && !fs.files.count(twins::host_name(n) + twins::kTemp));
+    assert(fs.files["StellarBladeSave00.sav"] == mine && fs.files["StellarBladeCoop00.sav"] == progress);
+    // Again (a later join): every one replaced, still only host files written.
     const std::string newer = save("the host's world, later");
-    assert(place(fs, 2, newer, 7656) == "" && fs.files["StellarBladeCoop02.sav"] == newer);
-    assert(fs.backup["StellarBladeCoop02.sav"] == world);
+    assert(place(fs, newer) == "");
+    for (int n = 0; n < twins::kSlots; ++n)
+      assert(fs.files[twins::host_name(n)] == newer);
     for (const std::string &w : fs.writes)
-      assert(w.rfind("StellarBladeSave", 0) != 0); // Never one of her own saves.
+      assert(w.rfind("StellarBladeHost0", 0) == 0); // Never one of her saves or copies.
+    assert(fs.backups_made == 0);
   }
   {
-    MemFs fs; // An untouched co-op copy in slot 1 (its line matches), and a line for slot 0 that must stay.
-    fs.files["StellarBladeCoop01.sav"] = mine, fs.times["StellarBladeCoop01.sav"] = 50;
-    fs.files[twins::kManifest] = "0 10 20 30 40\n1 " + std::to_string(mine.size()) + " 50 9 9\n";
-    assert(place(fs, 1, world, 1) == "" && fs.files["StellarBladeCoop01.sav"] == world);
-    assert(fs.backup["StellarBladeCoop01.sav"] == mine);
-    twins::Lines lines;
-    assert(twins::parse(fs.files[twins::kManifest], lines) && lines[0].present && !lines[1].present);
-  }
-  {
-    MemFs fs; // Her co-op progress in slot 3 (no line matches it): refused, nothing written.
-    fs.files["StellarBladeCoop03.sav"] = progress, fs.times["StellarBladeCoop03.sav"] = 60;
-    fs.files[twins::kManifest] = "3 1 2 3 4\n";
-    const std::string why = place(fs, 3, world, 1);
-    assert(why == "co-op slot 3 holds your own co-op progress: not replaced");
-    assert(fs.files["StellarBladeCoop03.sav"] == progress && fs.writes.empty() && fs.backups_made == 0);
-    // A record naming another slot does not make slot 3 the host's either.
-    fs.files[twins::kHostWorld] = "2 " + std::to_string(progress.size()) + " 60 1\n";
-    assert(place(fs, 3, world, 1) == why && fs.writes.empty());
-    // A save that fails the game's check, or a slot past 4: refused before anything.
+    MemFs fs; // A write that fails half way (host file 03): no host file left, so no slot loads an older world.
+    fs.files[twins::host_name(4)] = save("an older host's world");
+    fs.files["StellarBladeCoop00.sav"] = progress;
+    fs.fail_rename = twins::host_name(3);
+    assert(place(fs, world) == "StellarBladeHost03.sav could not be written");
+    for (int n = 0; n < twins::kSlots; ++n)
+      assert(!fs.files.count(twins::host_name(n)) && !fs.files.count(twins::host_name(n) + twins::kTemp));
+    assert(fs.files["StellarBladeCoop00.sav"] == progress);
+    // A save that fails the game's check: refused before anything.
     std::string broken = world;
     broken[10] ^= 1;
-    assert(place(fs, 0, broken, 1) == "the host's save fails the game's own load check" && fs.writes.empty());
-    assert(place(fs, 5, world, 1) == "no such co-op slot");
+    fs.writes.clear();
+    assert(place(fs, broken) == "the host's save fails the game's own load check" && fs.writes.empty());
   }
   {
     MemFs fs; // The host's read of its own save: whole and checked, or why not.

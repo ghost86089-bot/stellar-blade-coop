@@ -52,7 +52,7 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Doors, lifts, puzzles, fast travel, camps shared | missing | no code |
 | Death and respawn in co-op (survivor fights on, revive) | missing | each game handles its own death; host death only resets the guest's enemy HP |
 | Rejoin after a drop | built (guest rejoins within 60 s) | `link_core_test` |
-| The guest gets the host's world (save transfer) | verified in game both ways on the test link; loading it at join missing | 2026-10-22: game as host sent `StellarBladeCoop00.sav` to the bot, 629,372 bytes byte-identical; game as guest wrote the bot host's world to `StellarBladeCoop04.sav`, byte-identical, with its marker, and again over it on the next run |
+| The guest gets the host's world and Continue loads it | verified in game on the test link (game as guest of the bot, and as host) | 2026-10-22: game as host sent `StellarBladeCoop00.sav` to the bot, 629,372 bytes byte-identical. 2026-10-23: game as guest wrote the bot host's world to `StellarBladeHost00-04.sav` (byte-identical), switched to `saves=host` at the title, and its Continue entered slot 0 of it: the game's save after the load went to `StellarBladeHost00.sav`, her `StellarBladeSave00.sav` and `StellarBladeCoop00.sav` unchanged (same SHA-256) |
 | Hold EVE's death (for revive) | mapped in game, not wired | 2026-10-22: MinimumHP (stat 107) = 1 on her FSBActor holds her at 1 HP, alive, under enemy hits; set back to 0 she dies on the next hit |
 | Loot, inventory, upgrades | per player by design (each keeps her own) | README |
 | Level change, long sessions | not tested | upstream README |
@@ -82,14 +82,13 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    changes from the bot's claims, it dies once in both, and the logs agree.
 3. **Shared common enemies in game.** Turn on `same_spawns` and `same_place`, run their own probes, fix what breaks.
    Test: the bot scenario above with logs and one in-game screenshot per step.
-4. **Host-world start (decision above).** Save transfer over the link in chunks, a guest co-op slot, load on join.
+4. **Host-world start (decision above).** Save transfer over the link in chunks, a guest save set, load on join.
    Test: two games (game + bot, then two real clients) report the same save digest after join.
-   Built 2026-10-22 (`host_world.h`, wired in `steam_link.cpp`): a guest asks once a link (and on `coop world`); the
-   host sends the co-op save its game entered (`SBW` chunks of 60 KB, 8 a second, CRC-32 over the whole); the guest
-   checks the CRC and the game's own load check and writes it into co-op slot 5 at the title, never over her own co-op
-   progress (backed up first, its manifest line dropped, recorded in `StellarCoopHostWorld.txt`). Verified offline:
-   `host_world_test` (with a twin), and `tools/loop_e2e.py`: the real DLL as guest writes a 650 KB save byte-identical
-   in about 1.3 s.
+   Built 2026-10-22 (`host_world.h`, wired in `steam_link.cpp`): a guest asks every 10 s until a world arrives (and on
+   `coop world`); a host in her world sends the save her game entered (`SBW` chunks of 60 KB, 8 a second, CRC-32 over
+   the whole); the guest checks the CRC and the game's own load check. Where it goes changed on 2026-10-23 (below).
+   Verified offline: `host_world_test`, and `tools/loop_e2e.py`: the real DLL as guest writes a 650 KB save
+   byte-identical in about 1.3 s.
    In game 2026-10-22 (test link, bot partner): the game as host sent its co-op save, byte-identical (629,372 bytes);
    the game as guest wrote the bot host's world into co-op slot 5, byte-identical, and wrote it again over its own
    earlier copy on the next run. At its title a host's entered slot is the last session's (it read 0 before any
@@ -101,12 +100,23 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    in `StellarBladeCoop04.sav` (the newest file), Continue entered slot 0 and autosaved it. (b) Load Game lists one
    entry only and it too entered slot 0; slot 5 is not offered anywhere at the title. (That host's world was an older
    copy of slot 0, so "newest by the save's own time" is not ruled out, but neither menu can be relied on.)
-   Next: a third save set. The switch rewrites the game's 16-character save name in place (`StellarBladeSave` and
-   `StellarBladeCoop`, save_slot.h); `StellarBladeHost` has the same length. The guest writes the host's world to
-   `StellarBladeHost00.sav` and switches to that set at the title, so the game's own Continue (slot 0, the slot it
-   entered last) loads the host's world, its autosaves stay in the host set, and her own co-op progress is never in
-   the way. Test: her entered slot reads 0 with saves=host, `StellarBladeHost00.sav` changes and her
-   `StellarBladeCoop0N.sav` do not.
+   Built 2026-10-23: a third save set. The switch rewrites the game's 16-character save name in place
+   (`StellarBladeSave`, `StellarBladeCoop`, and now `StellarBladeHost`, save_slot.h). The title's slot list is built
+   from the files only at startup and on each return to the title, while loads use the name of the moment: so the
+   guest writes the host's world into all five `StellarBladeHost0N.sav` (read back; a failure removes all five) with
+   no save of hers loaded, then switches to the host set at the title (save_twins.h `to_host`, refused only while a
+   conversion runs), and whatever slot her Continue or Load Game picks is the host's world. Her saves and co-op copies
+   are never written; every co-op saves request is refused while the host set is on, until the game restarts; the
+   slot line reads `slot=coop ... saves=host`, so co-op features run on it. Verified: `save_slot_test`,
+   `save_twins_test`, `host_world_test`, `tools/loop_e2e.py` (the DLL as guest writes all five byte-identical), and
+   four twins that fail them (a failed write leaving files, the Host word one character off, a switch during a
+   conversion, the slot line not co-op on the host set). In game 2026-10-23 (game as guest of the bot, test link):
+   received, written, switched at the title, notice "The host's world is ready: press Continue to join it"; no co-op
+   saves question (it shows only on `saves=main`); Continue entered slot 0 (`slot=coop index=0 saves=host`), the shared
+   fight came on as guest, and the game's save after the load went to `StellarBladeHost00.sav` while her
+   `StellarBladeSave00.sav` and `StellarBladeCoop00.sav` kept their SHA-256. The run before this change is the twin:
+   without the host set, Continue entered her `StellarBladeCoop00.sav`. Not yet: two real clients comparing digests,
+   and a guest with no save of her own (the title then offers no Continue; untested).
 5. **Story and world sync, host authoritative.** Map with UE4SS dumps: quest/mission state, world flags, doors, lifts,
    fast travel, camps, cutscene and level-transition triggers. Send each as a host event; the guest applies it or is
    moved to the host. Test per event type, then a chapter played with the bot following the host.

@@ -262,7 +262,9 @@ int run_dll(bool as_host, const std::string &folder, uint16_t port, uint64_t sec
       linked = linked || (line.find(" accepted=1") != std::string::npos &&
                           line.find(" compatible=1") != std::string::npos);
     }
-    world = !as_host && GetFileAttributesA((saves + "\\" + coop::twins::kHostWorld).c_str()) != INVALID_FILE_ATTRIBUTES;
+    // place() writes the host files 00 to 04 in order: the last one there means the set is whole.
+    world = !as_host &&
+            GetFileAttributesA((saves + "\\" + coop::twins::host_name(4)).c_str()) != INVALID_FILE_ATTRIBUTES;
     if (as_host ? linked : world)
       break;
   }
@@ -271,9 +273,10 @@ int run_dll(bool as_host, const std::string &folder, uint16_t port, uint64_t sec
   if (as_host) {
     std::printf("BOT RESULT: dll linked=%d\n", linked ? 1 : 0);
   } else {
-    const std::string slot = read_file(saves + "\\" + coop::twins::twin_name(4)), expect = read_file(expect_file);
-    const bool same = world && !expect.empty() && slot == expect;
-    std::printf("--- %s\n%s", coop::twins::kHostWorld, read_file(saves + "\\" + coop::twins::kHostWorld).c_str());
+    const std::string expect = read_file(expect_file), slot = read_file(saves + "\\" + coop::twins::host_name(0));
+    bool same = world && !expect.empty();
+    for (int n = 0; n < coop::twins::kSlots; ++n)
+      same = same && read_file(saves + "\\" + coop::twins::host_name(n)) == expect;
     std::printf("BOT RESULT: dll guest linked=%d world_written=%d same_bytes=%d bytes=%zu\n", linked ? 1 : 0,
                 world ? 1 : 0, same ? 1 : 0, slot.size());
     linked = same;

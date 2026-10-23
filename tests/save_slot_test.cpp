@@ -210,6 +210,9 @@ int main() {
   assert(line(7, 4, true, Saves::coop) == "slot=unknown index=7 marker=4 saves=coop");
   assert(line(-1, kNone, true, Saves::coop) == "slot=unknown index=-1 marker=none saves=coop");
   assert(line(kUnread, kNone, true, Saves::coop) == "slot=unknown index=? marker=none saves=coop");
+  // The host's world a guest plays decides as the co-op copies do.
+  assert(line(3, kNotRead, true, Saves::host) == "slot=coop index=3 marker=? saves=host");
+  assert(line(3, kNone, false, Saves::host) == "slot=none index=3 marker=none saves=host");
   assert(line(4, 4, true, Saves::off) == "slot=coop index=4 marker=4 saves=off");
   assert(line(0, 4, true, Saves::off) == "slot=main index=0 marker=4 saves=off");
   assert(line(4, 4, true, Saves::unread) == "slot=unknown index=4 marker=4 saves=?");
@@ -224,6 +227,11 @@ int main() {
   m = names(u"StellarBladeCoop");
   n = m.find();
   assert(n.saves == Saves::coop && n.data == kData && std::string(n.text) == "StellarBladeCoop");
+  m = names(u"StellarBladeHost");
+  n = m.find();
+  assert(n.saves == Saves::host && std::string(n.text) == "StellarBladeHost" && std::string(saves_name(n.saves)) == "host");
+  m = names(u"StellarBladeHose"); // One character off: none of ours.
+  assert(m.find().saves == Saves::off);
   // A failed read at each step: no switch.
   for (int step = 1; step <= 6; ++step) {
     m = names();
@@ -333,28 +341,29 @@ int main() {
   auto image = [&m](uint64_t at, void *out, size_t size) { return m.read(at, out, size); };
   m = names();
   Names sw;
-  assert(sw.swap(kBase, image, cas, true).empty() && sw.saves() == Saves::coop && cas_at == kData + 24);
+  assert(sw.swap(kBase, image, cas, Saves::coop).empty() && sw.saves() == Saves::coop && cas_at == kData + 24);
   assert(m.find().saves == Saves::coop && std::string(m.find().text) == "StellarBladeCoop");
-  assert(sw.swap(kBase, image, cas, true) == "the save name reads coop" && cas_calls == 1);
-  assert(sw.swap(kBase, image, cas, false).empty() && sw.saves() == Saves::main && m.find().saves == Saves::main);
+  assert(sw.swap(kBase, image, cas, Saves::coop) == "the save name reads coop" && cas_calls == 1);
+  assert(sw.swap(kBase, image, cas, Saves::main).empty() && sw.saves() == Saves::main &&
+         m.find().saves == Saves::main);
   assert(cas_calls == 2 && !sw.latched());
   // A name another writer switched: refused by the first read, before any write. A swap the compare refuses: latched,
   // never tried again.
   m.put(kData + 24, kCoop);
-  assert(sw.swap(kBase, image, cas, true) == "the save name reads coop" && cas_calls == 2);
+  assert(sw.swap(kBase, image, cas, Saves::coop) == "the save name reads coop" && cas_calls == 2);
   m.put(kData + 24, kSave);
   auto refuse = [&cas_calls](uint64_t, uint64_t, uint64_t) {
     ++cas_calls;
     return false;
   };
-  assert(sw.swap(kBase, image, refuse, true) == "the save name could not be written" && sw.latched());
-  assert(sw.saves() == Saves::unread && sw.swap(kBase, image, cas, true) == "the save name reads ?: the save name "
+  assert(sw.swap(kBase, image, refuse, Saves::coop) == "the save name could not be written" && sw.latched());
+  assert(sw.saves() == Saves::unread && sw.swap(kBase, image, cas, Saves::coop) == "the save name reads ?: the save name "
                                                                             "could not be written");
   assert(cas_calls == 3 && m.find().saves == Saves::main);
   // A swap that does not read back: latched, and said as written, since the game may use the other files from then on.
   Names quiet;
   cas_writes = false;
-  assert(quiet.swap(kBase, image, cas, true) ==
+  assert(quiet.swap(kBase, image, cas, Saves::coop) ==
              "the save name was written but did not read back: restart the game before you play" &&
          quiet.latched() && quiet.saves() == Saves::unread);
   cas_writes = true;
@@ -365,7 +374,7 @@ int main() {
     m.put(kNamesAt, uint64_t(0x10));
     return swapped;
   };
-  assert(gone_after.swap(kBase, image, vanish, true) ==
+  assert(gone_after.swap(kBase, image, vanish, Saves::coop) ==
              "the save name was written but did not read back: restart the game before you play" &&
          gone_after.latched());
   m = names();
@@ -375,8 +384,20 @@ int main() {
   m.put(kElements + 0x48, kData + 0x40);
   text(m, kData + 0x40, std::u16string(u"StellarBladeSave") + u'\0');
   const int calls = cas_calls;
-  assert(moved_state.swap(kBase, image, cas, true) == "the save name reads ?: the save name moved");
+  assert(moved_state.swap(kBase, image, cas, Saves::coop) == "the save name reads ?: the save name moved");
   assert(cas_calls == calls && moved_state.latched());
+  // The host's world: from her own saves or from the copies, each one compare-and-swap of exactly that set's word;
+  // the set it already reads, or none, refused before any write.
+  m = names();
+  Names host_sw;
+  const int before = cas_calls;
+  assert(host_sw.swap(kBase, image, cas, Saves::host).empty() && host_sw.saves() == Saves::host);
+  assert(std::string(m.find().text) == "StellarBladeHost" && kHost == word(Saves::host));
+  assert(host_sw.swap(kBase, image, cas, Saves::host) == "the save name reads host" && cas_calls == before + 1);
+  assert(host_sw.swap(kBase, image, cas, Saves::off) == "the save name reads host" && cas_calls == before + 1);
+  assert(host_sw.swap(kBase, image, cas, Saves::coop).empty() && m.find().saves == Saves::coop);
+  assert(host_sw.swap(kBase, image, cas, Saves::host).empty() && m.find().saves == Saves::host);
+  assert(cas_calls == before + 3 && !host_sw.latched());
   // Off the title: a save loaded, the title screen not shown (a loading screen, a New Game intro, an older Lua or
   // none), Continue or Load Game chosen there, or the load state unreadable. Only Lua's title with load mode 0 passes.
   assert(not_title(false, true, 0).empty());
