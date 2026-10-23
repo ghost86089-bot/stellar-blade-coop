@@ -34,13 +34,13 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Join and leave a session | verified on the test link; Steam path verified upstream only (two PCs, 2026-10-17) | in-game run: lobby, hello both ways, `peer linked` with the bot; `loop_steam_test`, `link_core_test` |
 | Test with one PC (bot partner) | verified | `STELLARCOOP_LOOP`, `loop_bot`, `tools/loop_e2e.py`, in-game link in 15–18 s |
 | Bot shows as a moving EVE (echo of the host's own, 150 cm along X) | verified in game | 2026-10-22: `Ghost ... built: 6 parts (4 leaders)`, `drawn: 4 of 4 leaders`; screenshot of both EVEs walking on the first beach; partner card and "2 m" marker on screen |
-| Chat between the players | verified in game | the bot's "hello from the bot" shown in the game's chat box |
+| Chat between the players | verified in game both ways | 2026-10-23: the bot's "hello from the bot" in the game's chat box, and a line typed there ("test from buffy") reached the bot (`bot heard: in test from buffy`); the same box showed the session notices (lobby, the shared-enemies/co-op-save notice, zone changes) and Esc closed it and gave the game its keys back |
 | Co-op save copies (Convert and play co-op) | verified in game on the test link | `StellarBladeCoop00.sav` made beside the save; Continue loads it (`saves=coop`) |
 | Shared common enemies, host side: the guest's hits change the host's real enemies, a lethal claim kills | verified in game (host side) | 2026-10-22, first beach (Story Mode, scale 135/115): 58 bot claims of 150 HP, 58 confirmed exactly in the host's values, 0 wrong, 0 refused; enemy 494 from 5103 to 3 HP, killed by the lethal claim; host `claims=58 refused=0 kills=1` |
 | Shared common enemies, guest side (her own copies paired and corrected) | built, not tested in game | needs two real games |
 | Saves kept apart from the player's real saves during tests | verified | `userdir_probe.ps1`: private LOCALAPPDATA + `-userdir`; real Saved 0 differences in every run |
 | See the partner move (ghost) | built here; verified upstream between two PCs | in game here: poses streamed (~20/s); the bot sends no poses yet, so no ghost was seen |
-| Partner HUD, chat, synced photo mode | built (chat verified bot↔bot) | `tools/loop_e2e.py` chat both ways; HUD not seen in game |
+| Partner HUD, chat, synced photo mode | built; the HUD and the chat seen in game 2026-10-23 | the partner HUD (the friend's name, HP/SH/BE bars) drawn at the top left in the test copy; the co-op menu opened on F5, its keys moved the selection and Enter chose a row; photo mode still untested in game |
 | Common enemies: one HP bar, one death | built, not tested in game (upstream: "not tested in game yet") | `fight_engine_test`, `fight_sync_test` pass (ASan, UBSan) |
 | Scaling for two, kill credit | built | `fight_engine_test` (scaled 135/115) |
 | Takedowns on shared enemies | built | `pilot_test`, `fight_engine_test` |
@@ -131,9 +131,18 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    it, read back; volatile fields, a reset zone and reordered zones change nothing; a quest state, a task value, a
    mission flag, an env object and a world object each show as one line), and the test save before and after a walk on
    the first beach: 236 changed lines over the whole save, 3 of them story (two achievement flags and one effect
-   volume switched on). Not mapped yet, and listed in `docs/story.md`: live unsaved state, which env alias is a door or
-   a lift, cutscenes and level transitions, the enums' other values, and `bZoneReset` (excluded: it flips for every
-   zone that is not the loaded one). Not in game: nothing of this has run against a live game.
+   volume switched on). Read live 2026-10-23: `coop story [dump|find]` (`Scripts/story.lua`, read only) prints the same
+   lines from the save object the running game holds, to `StellarCoopStory.txt` in the mod folder, asked by command or
+   by `coop-story.txt` at load; enum fields are named through the game's own `UEnum`s. In the test copy, asked at the
+   title and run as the world came up, the dump wrote 1,532 lines whose digest is the file's (`tools/story.py compare`:
+   "the same"); two minutes later in the same session the game held a partial object (946 lines, 130 of 199 zones), so
+   the full mirror is only there at load. Played on 2026-10-23: two dumps 25 s apart with nothing done between them are
+   identical, so in-session changes can be diffed; 32 s after an autosave (a 1,976,427-byte save) the dump found three
+   save objects and wrote 10,800 lines in 15.3 s, the quests and mission records matching the new save and the
+   world-actor stage not (maps as pointers, positions not filtered, 1-based indices), the zone event items off by one;
+   73 s later the objects were gone again. `docs/story.md` has the numbers. Not mapped yet, and listed in
+   `docs/story.md`: live changes during play, which env alias is a door or a lift, cutscenes and level transitions, the
+   enums' other values, and `bZoneReset` (excluded: it flips for every zone that is not the loaded one).
 6. **Death and respawn.** A downed player waits while the other fights; respawn at the host's last camp; both down
    resets the area. Test with scripted deaths.
    Logic built 2026-10-22 (`revive_core.h`, the owner's Sekiro revive rules): down instead of dead, revived by the

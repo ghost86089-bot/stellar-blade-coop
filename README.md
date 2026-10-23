@@ -6,7 +6,10 @@ other's EVE in their own world.
 Status: v0.1.1, an experimental pre-release. It runs on Stellar Blade's Steam build 24463856 only. The ghost co-op was
 first played between two PCs on 2026-10-17, one on Linux with Proton and one on Windows, between Belgium and Brazil at
 about 240 ms ping. Longer sessions, level changes and the optional looks have not been tested between two PCs. The
-co-op menu, the chat and the partner HUD have not been tested in game yet.
+co-op menu, the chat and the partner HUD were first checked in game on 2026-10-23, in the test copy on one PC with the
+loop bot: F5 opens the menu and the keys navigate it, its status line showed the session and the ping, the chat box
+opened from the menu's Chat row, a line typed there reached the bot, and the bot's line and the mod's notices appeared
+above it in the feed.
 
 StellarCoop is a UE4SS mod made of Lua scripts and a native DLL. The link between the two games goes through the Steam
 client that the game already runs, so the mod needs no other program and no server of its own.
@@ -68,7 +71,7 @@ Close the game before you copy, change or delete any mod file. [INSTALL.md](INST
 | [docs/how-it-works.md](docs/how-it-works.md) | The Steam link, the ghost pipeline, safety design, loopback and replay |
 | [docs/night-operation.md](docs/night-operation.md) | The cut mode, the plan, and the two previews |
 | [docs/saves.md](docs/saves.md) | Save safety, backups, Steam Cloud, the co-op saves, recovery |
-| [docs/story.md](docs/story.md) | Where the save keeps the story and world state (quests, mission records, zones, doors), and the tool that snapshots and diffs it |
+| [docs/story.md](docs/story.md) | Where the save keeps the story and world state (quests, mission records, zones, doors), the tool that snapshots and diffs it, and the read-only live dump (`coop story`) |
 | [docs/building.md](docs/building.md) | Building from source, tests, the reproducible build, repository layout |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and which logs to send |
 

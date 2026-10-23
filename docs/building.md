@@ -104,8 +104,9 @@ build/host/pose_codec_test
 ```
 
 - Lua tests (`capture`, `chat`, `join`, `keybind`, `link`, `main`, `nightop`, `notice`, `partner`, `puppet`,
-  `recruiter`, `recruiter_text`, `saves`, `settings_file`, `ui`, `ui_kit`, `ui_model`) run the scripts, with fake UE4SS
-  objects for those that call the engine. In the capture test, any write to the fake EVE fails the test. `main_test`
+  `recruiter`, `recruiter_text`, `saves`, `settings_file`, `story_dump`, `ui`, `ui_kit`, `ui_model`) run the scripts,
+  with fake UE4SS objects for those that call the engine. `story_dump_test` also feeds the dump wrappers
+  (`RemoteUnrealParam`) as UE4SS hands them over, and compares its lines with `tools/story.py`'s for the same data. In the capture test, any write to the fake EVE fails the test. `main_test`
   also covers `coop fight pilot` (its `test target` included), the `same_place` and `aggro` settings and rows, the
   `same_spawns` and `enemy_extra` settings and rows, `coop fight spawn probe`, and the same place and same spawns notices in both
   languages.
