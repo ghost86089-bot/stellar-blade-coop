@@ -40,7 +40,7 @@ stage4-spawn + this fork's Windows port and test link), on Steam build 24463856,
 | Shared common enemies, guest side (her own copies paired and corrected) | built, not tested in game | needs two real games |
 | Saves kept apart from the player's real saves during tests | verified | `userdir_probe.ps1`: private LOCALAPPDATA + `-userdir`; real Saved 0 differences in every run |
 | See the partner move (ghost) | built here; verified upstream between two PCs | in game here: poses streamed (~20/s); the bot sends no poses yet, so no ghost was seen |
-| Partner HUD, chat, synced photo mode | built; the HUD and the chat seen in game 2026-10-23 | the partner HUD (the friend's name, HP/SH/BE bars) drawn at the top left in the test copy; the co-op menu opened on F5, its keys moved the selection and Enter chose a row; photo mode still untested in game |
+| Partner HUD, chat, synced photo mode | verified in game on the test link, except the pause itself | the partner HUD (the friend's name, HP/SH/BE bars) drawn at the top left in the test copy; F5 opened the menu (title, rows, `Co-op: hosting Loop quest. 15 ms`), arrows moved and Enter chose; the Options page listed Controls, Photo mode and Partner with their values, Right changed `photo_sync=both` to `notice` in `coop-settings.txt` (and kept `coop-settings.old.txt`), Left put it back, Esc went back from Options and then closed the menu; F6 put `Co-op: hosting Loop quest.` in the feed; F8 left the session (`asked the native part: leave`, then `Not in a session.` on the next press), the partner HUD and the ghost went with it, and the menu then offered Host a session, Join a friend and Join with a code. 2026-10-23, night: a rebind taken in the menu (status_key F6 to F7) was written at once and F7 showed the status while F6 no longer did, and rebinding it back worked; the photo settings rows wrote `photo_sync`, `photo_freeze_max` (11 min shown and written as 660) and `photo_ghost` and were restored; Who can join Friends to With a code, then Leave, then Host a session gave `Hosting. Your join code is 000-01VQ.` and the Copy my code row, whose clip was `000-01VQ` (`Join code 000-01VQ copied.`); Write a bug report wrote a 12,861-byte `coop-report.txt` with the run, the loaded DLLs and the status; Join with a code stayed open on `ZZZ` (`A join code is 7 letters and digits, like XXX-XXXX.`) and closed on `ABC-1234` with only `Steam refused to join lobby 109775243446356068` in the log (the loop link's callback; the Steam path's `Could not join` notices are unit-tested); the chat's Enter bind opened the box on its own and `coop status` typed there reached the bot (`bot heard: in coop status`); photo mode entered with P (`photo=1`, the mod's HUD gone, the ghost still in the shot, the shared fight paused, and the notice `Loop guest's game does not pause for photos.` because the bot has no pause), exited with End then the game's `Exit Photo Mode` question and Enter (`photo=0`, shared fight on again), and the bot saw `photo=1` and `photo=0`; the pause of a real friend's game is not tested (the bot cannot pause) |
 | Common enemies: one HP bar, one death | built, not tested in game (upstream: "not tested in game yet") | `fight_engine_test`, `fight_sync_test` pass (ASan, UBSan) |
 | Scaling for two, kill credit | built | `fight_engine_test` (scaled 135/115) |
 | Takedowns on shared enemies | built | `pilot_test`, `fight_engine_test` |
@@ -140,9 +140,21 @@ Plan below assumes 2; it needs the owner's OK before step 4.
    identical, so in-session changes can be diffed; 32 s after an autosave (a 1,976,427-byte save) the dump found three
    save objects and wrote 10,800 lines in 15.3 s, the quests and mission records matching the new save and the
    world-actor stage not (maps as pointers, positions not filtered, 1-based indices), the zone event items off by one;
-   73 s later the objects were gone again. `docs/story.md` has the numbers. Not mapped yet, and listed in
-   `docs/story.md`: live changes during play, which env alias is a door or a lift, cutscenes and level transitions, the
-   enums' other values, and `bZoneReset` (excluded: it flips for every zone that is not the loaded one).
+   73 s later the objects were gone again. Fixed the same night: live `TMap`s are walked entry by entry with their keys
+   named through `ESBElementType`, every list's fallback name is the save's 0-based index, `Location`/`Rotation` and
+   `PhysicsConstraintStateMap` (never in the file) are filtered, `SaveType` is named through `ESBZoneObjectSaveType`,
+   and `tools/story.py` reads a finished quest's struct as well as its older name. On that 1.9 MB save the dump then
+   wrote 10,430 lines and `compare` printed `the same` (digest `faeb83f9…`, nothing only in either), world actors
+   included — the whole object now mirrors at load and around a save. A partial object also drops parts of the save (166 of 299 env entries, 528
+   of 950 mission-record lines two minutes after a load). `coop story find`, typed into the UE4SS console, wrote its
+   listing, but `FindAllOf('Class')` fails in this build and it lists only the five class names it knows.
+   `docs/story.md` has the numbers. Played again 2026-10-23 (night): two dumps 25 s apart with nothing done were
+   identical (949 lines, header included), and an 8 s walk forward made the game autosave; a dump 16 s after the write
+   found three save objects, merged them into 1,532 lines in 6.6 s, and `tools/story.py compare` said `the same` as the
+   new `StellarBladeCoop00.sav` (648,080 bytes) — digest and line count. So a live change is visible once the game
+   writes its save, not before. Not mapped yet, and listed in `docs/story.md`: a story change seen between two dumps
+   without a save in between, which env alias is a door or a lift, cutscenes and level transitions, the enums' other
+   values, and `bZoneReset` (excluded: it flips for every zone that is not the loaded one).
 6. **Death and respawn.** A downed player waits while the other fights; respawn at the host's last camp; both down
    resets the area. Test with scripted deaths.
    Logic built 2026-10-22 (`revive_core.h`, the owner's Sekiro revive rules): down instead of dead, revived by the
